@@ -1,0 +1,47 @@
+# Copy to <fleet-dir>/fleet.conf. Sourced as shell by engine/fleet and read by Fleet View.
+
+FLEET_NAME=myrepo
+REPO=/path/to/your/clone            # source repo the worktrees share a .git with
+WORKERS="worker-1 worker-2 worker-3"
+WORKER_KIND=worktree                # worktree | clone
+BASE_REMOTE=origin
+BASE_BRANCH=main
+LEASE_HOURS=4
+BEADS_PREFIX=fleet
+TASK_KEY_PATTERN='^[A-Za-z0-9._-]+$'   # e.g. '^(PROJ-[0-9]+|chore-[a-z0-9-]+)$' for ticket keys
+
+EXTRA_BASES=""                      # other refs task branches may be cut from, e.g. "origin/develop";
+                                    # `fleet gate` measures against the nearest one
+JIRA_URL=""                         # Fleet View only: turns ticket keys into links, e.g. https://your-site.atlassian.net
+
+# Gate: checks `fleet gate <worker>` runs on the worker AND on its merge-base, so the
+# baseline is measured, never remembered. `release --state review` needs a pass on the
+# exact code being released. One check per line: name|kind|path prefixes|command
+#   kind      test       fails only if it fails here and passes on the base
+#             typecheck  fails on any error line (GATE_ERROR_RE) not on the base
+#   prefixes  space-separated; the check runs when a changed path starts with one.
+#             Empty = always run.
+# GATE="
+# test|test|src/ tests/|npm test --silent
+# types|typecheck|src/|npx tsc --noEmit
+# "
+# GATE_ERROR_RE='error TS[0-9]+|^[0-9]+ ERROR '   # default: tsc and svelte-check --output machine
+# GATE_SHARED="node_modules"        # gitignored dirs the base run borrows from the worker
+
+# Intent and review: the harness around each task.
+# BRIEF_REQUIRED=1  The agent grills the user (mattpocock-skills:grilling) and writes
+#                   <fleet-dir>/briefs/<TASK>.md (## Goal, ## Acceptance criteria, ## Out of scope,
+#                   ## Decisions) before it may edit the worker (engine/fleet-guard hook) or gate.
+# REVIEW_ROUNDS=3   `release --state review` needs `fleet review`: a fresh headless Claude runs
+#                   mattpocock-skills:code-review and ponytail:ponytail-review against the brief,
+#                   checks the notes' claims, and checks that what the diff uses exists. Blocking and
+#                   should findings become review comments. After this many rounds a human takes over.
+# REVIEW_MODEL=""   reviewer model; empty = your default. A different model from the author's
+#                   catches different blind spots.
+# REVIEW_TIMEOUT_MIN=30
+
+# Optional hook, run per worker by `fleet provision`. Example: share node_modules
+# from REPO copy-on-write (APFS on macOS; drop -c elsewhere for a plain copy).
+# fleet_provision_worker() {
+#   [ -e "$FLEET/$1/node_modules" ] || cp -Rc "$REPO/node_modules" "$FLEET/$1/node_modules"
+# }

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Claude Code PreToolUse hook for Edit|Write|MultiEdit|NotebookEdit. Inside a fleet folder
+# it lets an agent edit only a worker its own session has claimed and never main/; when
+# the fleet sets BRIEF_REQUIRED=1, only once the task has a brief (the user was grilled
+# first). Outside a fleet folder it does nothing. Exit 2 blocks the edit; stderr tells
+# the agent what to do instead.
+in="$(cat)"
+f="$(jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' <<<"$in" 2>/dev/null)"
+[ -n "$f" ] || exit 0
+case "$f" in /*) ;; *) f="$(jq -r '.cwd // empty' <<<"$in")/$f" ;; esac
+
+d="$(dirname "$f")"
+while [ "$d" != / ] && [ "$d" != . ] && [ ! -f "$d/fleet.conf" ]; do d="$(dirname "$d")"; done
+[ -f "$d/fleet.conf" ] || exit 0
+fleet="$d"; rel="${f#"$fleet"/}"; top="${rel%%/*}"
+
+[ "$top" = main ] && { echo "fleet: $fleet/main is the read-only reference. Work in the worker you claimed." >&2; exit 2; }
+[ -e "$fleet/$top/.git" ] && [ "$top" != "$rel" ] || exit 0     # not inside a worker (briefs/, scratchpad/, ...)
+
+owner="$fleet/.locks/$top/owner"
+[ -f "$owner" ] || { echo "fleet: $top is not claimed. Claim a worker first: fleet claim <TASK> (bosun skill)." >&2; exit 2; }
+sid="$(jq -r '.session_id // empty' <<<"$in")"
+osid="$(sed -n 's/^session=//p' "$owner")"
+[ -z "$sid" ] || [ "$sid" = "$osid" ] \
+  || { echo "fleet: $top is claimed by another session ($osid). Claim your own worker." >&2; exit 2; }
+
+if grep -q '^BRIEF_REQUIRED=1' "$fleet/fleet.conf"; then
+  task="$(sed -n 's/^task=//p' "$owner")"
+  grep -q '^## Acceptance criteria' "$fleet/briefs/$task.md" 2>/dev/null || {
+    echo "fleet: $task has no brief yet, so edits in $top are blocked. Grill the user first with the" >&2
+    echo "mattpocock-skills:grilling skill, starting from the ticket. When they confirm, write" >&2
+    echo "$fleet/briefs/$task.md with ## Goal, ## Acceptance criteria, ## Out of scope and ## Decisions," >&2
+    echo "and paste the ticket text in. The reviewer uses it as the spec." >&2
+    exit 2; }
+fi
+exit 0

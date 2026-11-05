@@ -1,0 +1,927 @@
+#!/usr/bin/env bash
+# fleet — shared coordination engine for the *-fleet skills.
+#
+# Owns: worker locks (with an owner file and a lease), the per-task record that
+# lets a later agent resume, and the status view. Repo-specific git flow (gate,
+# merge vs. push-for-review) stays in each skill.
+#
+# Usage: fleet -f <fleet-dir> <command> [args]     (or FLEET_DIR=<fleet-dir>)
+#
+#   init                         create the task store in <fleet-dir>/beads
+#   provision                    create missing worktrees (worktree fleets)
+#   status [--json]              workers, lease state, resumable tasks
+#   gc [--apply] [--json]        bookkeeping that no longer matches the world: workers of
+#                                ended sessions, records whose branch is merged or nobody
+#                                holds. Report only; --apply frees, closes and pauses
+#   claim <TASK> [--branch B] [--title T] [--fresh]
+#                                claim a worker for TASK; resumes its record if
+#                                one exists (adopting its INTERRUPTED worker, uncommitted
+#                                work included), --fresh archives it and starts over
+#   note <worker> <text>         append progress to the task record, renew lease
+#   renew <worker>               renew the lease only
+#   gate <worker>                run the GATE checks on the worker and on its merge-base,
+#                                record the result against the exact code it ran on
+#   review <worker>              an independent headless reviewer checks the change against
+#                                the brief; findings become review comments (REVIEW_ROUNDS)
+#   release <worker> --state paused|review|done [--note T] [--wip]
+#                                --state review needs a passing gate (and, if enabled, a
+#                                review) on the current code, and no unanswered comments
+#
+# Briefs (BRIEF_REQUIRED=1): <fleet-dir>/briefs/<TASK>.md, written after grilling the
+# user. The gate refuses without one, and engine/fleet-guard (a PreToolUse hook) blocks
+# edits in the worker until it exists. The reviewer treats it as the spec.
+#   reclaim <worker> [--salvage] [--legacy]
+#                                free a dead/expired worker (--salvage commits
+#                                its uncommitted work to the task branch first)
+#   show <TASK>                  print a task's record
+#
+# Config: <fleet-dir>/fleet.conf (sourced). See any fleet's conf for the keys.
+
+set -u
+
+die()  { echo "fleet: $*" >&2; exit 1; }
+warn() { echo "fleet: $*" >&2; }
+
+FLEET="${FLEET_DIR:-}"
+if [ "${1:-}" = "-f" ]; then FLEET="${2:-}"; shift 2; fi
+[ -n "$FLEET" ] || die "no fleet dir (use -f <dir> or FLEET_DIR)"
+[ -f "$FLEET/fleet.conf" ] || die "no fleet.conf in $FLEET"
+
+# Defaults, then the fleet's own config.
+FLEET_NAME="$(basename "$FLEET")"
+REPO=""                       # source repo for worktrees; empty for clone fleets
+WORKERS="worker-1 worker-2 worker-3"
+WORKER_KIND="worktree"        # worktree | clone
+BASE_REMOTE="origin"
+BASE_BRANCH="main"
+LEASE_HOURS=4
+BEADS_PREFIX="fleet"
+TASK_KEY_PATTERN='^[A-Za-z0-9._-]+$'
+EXTRA_BASES=""                # other refs task branches may be cut from
+GATE=""                       # checks, one per line: name|kind|path prefixes|command (see fleet.conf.example)
+GATE_ERROR_RE='error TS[0-9]+|^[0-9]+ ERROR '   # typecheck error lines: tsc, svelte-check --output machine
+GATE_SHARED=""                # gitignored dirs (node_modules) the base run borrows from the worker
+BRIEF_REQUIRED=0              # 1: a task needs a brief, grilled with the user, before edits and gate
+REVIEW_ROUNDS=0               # >0: review needs an independent reviewer pass; rounds before it goes to a human
+REVIEW_MODEL=""               # reviewer model; empty = the user's default
+REVIEW_TIMEOUT_MIN=30
+REVIEW_BIN="claude"           # the headless reviewer (tests swap in a stub)
+# shellcheck disable=SC1091
+. "$FLEET/fleet.conf"
+
+BASE_REF="$BASE_REMOTE/$BASE_BRANCH"
+LOCKS="$FLEET/.locks"
+REVIEWS="$FLEET/scratchpad/reviews"   # <TASK>.md, written by the Fleet View VS Code extension
+GATE_DIR="$FLEET/.gate"               # run-<worker>/ logs, base/<sha>/ cached base results, review/<TASK>/
+BRIEFS="$FLEET/briefs"                # <TASK>.md: what the user and the agent agreed to build
+STORE="$FLEET/beads"
+export BEADS_DIR="$STORE/.beads"
+export BD_NON_INTERACTIVE=1 BD_DISABLE_METRICS=1 BD_NO_INSTALL_HOOKS=1 BD_NO_PAGER=1
+
+SESSION="${CLAUDE_CODE_SESSION_ID:-manual-$USER}"
+OWNER_PID="${CLAUDE_PID:-$PPID}"
+SESSIONS_DIR="${CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}"   # <pid>.json per running Claude Code process
+export BD_ACTOR="$SESSION"
+
+now()  { date +%s; }
+iso()  { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
+bdq()  { bd "$@" 2>/dev/null; }
+
+need_store() { [ -d "$BEADS_DIR" ] || die "task store missing — run: fleet -f $FLEET init"; }
+is_worker()  { case " $WORKERS " in *" $1 "*) return 0;; esac; return 1; }
+
+# --- owner file -------------------------------------------------------------
+
+owner_get() { # <worker> <key>
+  [ -f "$LOCKS/$1/owner" ] || return 1
+  sed -n "s/^$2=//p" "$LOCKS/$1/owner" | head -1
+}
+
+owner_write() { # <worker> <task> <bead> <branch> [claimed_at]
+  local t; t="$(now)"
+  local claimed="${5:-$t}"
+  cat > "$LOCKS/$1/owner.tmp" <<EOF
+session=$SESSION
+pid=$OWNER_PID
+task=$2
+bead=$3
+branch=$4
+claimed_at=$claimed
+renewed_at=$t
+lease_until=$((t + LEASE_HOURS * 3600))
+EOF
+  mv "$LOCKS/$1/owner.tmp" "$LOCKS/$1/owner"
+}
+
+# Is the owner still running? A running Claude process carrying the session id says yes: a
+# resumed session (claude --resume) keeps its id but gets a new pid, so the owner file's pid
+# goes stale. The pid is only the fallback, for sessions that are not Claude Code.
+# ponytail: a reused pid reads as alive, as before; compare process start times if that bites.
+owner_alive() { # <session> <pid>
+  local p
+  for p in $(jq -r --arg s "$1" 'select(.sessionId == $s) | .pid' "$SESSIONS_DIR"/*.json 2>/dev/null); do
+    kill -0 "$p" 2>/dev/null && return 0
+  done
+  [ -z "$2" ] || kill -0 "$2" 2>/dev/null
+}
+
+# FREE | CLAIMED | EXPIRED (lease ran out, session still running) | DEAD (session ended, clean
+# tree) | INTERRUPTED (session ended with uncommitted work: only its own task may adopt it)
+# | LEGACY (no owner file)
+lock_state() { # <worker>
+  [ -d "$LOCKS/$1" ] || { echo FREE; return; }
+  [ -f "$LOCKS/$1/owner" ] || { echo LEGACY; return; }
+  if ! owner_alive "$(owner_get "$1" session)" "$(owner_get "$1" pid)"; then
+    [ "$(dirty_count "$1")" = 0 ] && echo DEAD || echo INTERRUPTED; return
+  fi
+  local until; until="$(owner_get "$1" lease_until)"
+  [ "$(now)" -gt "${until:-0}" ] && echo EXPIRED || echo CLAIMED
+}
+
+dirty_count() { git -C "$FLEET/$1" status --porcelain 2>/dev/null | wc -l | tr -d ' '; }
+
+mine_or_die() { # <worker>
+  is_worker "$1" || die "unknown worker: $1"
+  [ -f "$LOCKS/$1/owner" ] || die "$1 has no owner file (not claimed through fleet)"
+  local s; s="$(owner_get "$1" session)"
+  [ "$s" = "$SESSION" ] || die "$1 is owned by session $s, not this one ($SESSION)"
+}
+
+unlock() { rm -f "$LOCKS/$1/owner" "$LOCKS/$1/owner.tmp"; rmdir "$LOCKS/$1" 2>/dev/null; }
+
+# --- task record (a bead keyed by external-ref) -----------------------------
+
+task_bead() { # <TASK> -> id of the open record, if any
+  bdq list --external-ref "$1" --json | jq -r '.[0].id // empty'
+}
+bead_field() { # <id> <jq-path>
+  bdq show "$1" --json | jq -r "(if type==\"array\" then .[0] else . end) | $2 // empty"
+}
+
+# Is TASK currently held by a live claim? Prints the worker.
+task_holder() {
+  local w
+  for w in $WORKERS; do
+    [ "$(owner_get "$w" task 2>/dev/null)" = "$1" ] && { echo "$w"; return 0; }
+  done
+  return 1
+}
+
+refresh_reference() {
+  [ "$WORKER_KIND" = worktree ] && [ -e "$FLEET/main/.git" ] || return 0
+  git -C "$FLEET/main" checkout -q --detach "$BASE_REF" 2>/dev/null || true
+}
+
+# Print a task's open review comments, so claim and every note surface them.
+review_open() { # <TASK>
+  local f="$REVIEWS/$1.md" n
+  [ -f "$f" ] || return 0
+  n="$(grep -c '^- \[ \]' "$f")"
+  [ "${n:-0}" -gt 0 ] || return 0
+  echo
+  echo "=== $n open review comment(s) — $f"
+  echo "=== address each, then edit the file: '- [ ]' -> '- [x]' plus an indented '> what you did' line"
+  awk '/^## /{h=$0; next} /^- \[ \]/{print h; print; p=1; next} p && /^[[:space:]]/{print; next} {p=0}' "$f"
+}
+
+# Review items nobody has answered: "- [ ]" with no indented "> reply" under it.
+review_unanswered() { # <TASK>
+  awk '/^- \[ \]/{n+=o; o=1; next} /^- \[[xX]\]/{n+=o; o=0; next} /^[[:space:]]+>/{o=0; next}
+       /^## / || /^[[:space:]]*$/{n+=o; o=0} END{print n+o}' "$REVIEWS/$1.md" 2>/dev/null || echo 0
+}
+
+# --- brief: the user's intent, pinned down before any code ---
+
+brief_ok() { grep -q '^## Acceptance criteria' "$BRIEFS/$1.md" 2>/dev/null; } # <TASK>
+brief_hint() { # <TASK>
+  echo "=== No brief for $1 yet. Before you change any code:"
+  echo "===   1. Grill the user with the mattpocock-skills:grilling skill, starting from the ticket."
+  echo "===   2. When they confirm, write $BRIEFS/$1.md with ## Goal, ## Acceptance criteria,"
+  echo "===      ## Out of scope and ## Decisions, and paste the ticket text in. The reviewer uses it as the spec."
+  echo "=== Edits in the worker are blocked until it exists."
+}
+
+# --- gate: evidence the script gathers itself, so nobody has to take an agent's word ---
+
+# The worker's code as one tree id: HEAD plus every staged, unstaged and untracked
+# change. Same id means same code, so a gate result is tied to exactly what it ran on.
+tree_id() { # <dir>
+  local idx="$GATE_DIR/index-$$" t
+  mkdir -p "$GATE_DIR"
+  cp "$(git -C "$1" rev-parse --path-format=absolute --git-path index)" "$idx" 2>/dev/null || rm -f "$idx"
+  t="$(GIT_INDEX_FILE="$idx" git -C "$1" add -A 2>/dev/null && GIT_INDEX_FILE="$idx" git -C "$1" write-tree)"
+  rm -f "$idx"
+  [ -n "$t" ] && echo "$t"
+}
+
+# "<sha> <ref>": the merge-base with whichever of BASE_REF/EXTRA_BASES the branch is
+# closest to, so a branch cut from a staging branch is not blamed for staging's errors.
+gate_base() { # <dir>
+  local r mb n best="" bestn=""
+  for r in $BASE_REF $EXTRA_BASES; do
+    mb="$(git -C "$1" merge-base HEAD "$r" 2>/dev/null)" || continue
+    n="$(git -C "$1" rev-list --count "$mb..HEAD")"
+    if [ -z "$bestn" ] || [ "$n" -lt "$bestn" ]; then best="$mb $r"; bestn="$n"; fi
+  done
+  [ -n "$best" ] && echo "$best"
+}
+
+# Does any changed path start with one of the space-separated prefixes? No prefixes = always.
+touched() { # <changed-paths> <prefixes>
+  local -a ps; local p f
+  read -ra ps <<<"$2"
+  [ "${#ps[@]}" = 0 ] && return 0
+  for p in "${ps[@]}"; do
+    while IFS= read -r f; do case "$f" in "$p"*) return 0 ;; esac; done <<<"$1"
+  done
+  return 1
+}
+
+# Run one check in <dir>: <out>.log, <out>.exit and, for a typecheck, <out>.sig — the
+# error lines with paths and line:col stripped, so moved code still matches.
+gate_run() { # <dir> <kind> <cmd> <out>
+  ( cd "$1" && eval "$3" ) > "$4.log" 2>&1; echo $? > "$4.exit"
+  [ "$2" = typecheck ] || return 0
+  grep -E "$GATE_ERROR_RE" "$4.log" \
+    | sed -E "s#$1/##g; s#$(cd "$1" && pwd -P)/##g; s/^[0-9]+ //; s/[0-9]+[:,][0-9]+//g" | LC_ALL=C sort > "$4.sig"
+}
+
+# A throwaway worktree at <sha> for the base run. It borrows GATE_SHARED from the
+# worker, so base and branch differ only in the code, never in installed packages.
+GATE_TREE=""
+gate_tree_drop() { [ -n "$GATE_TREE" ] && git -C "$FLEET/$1" worktree remove --force "$GATE_TREE" 2>/dev/null; GATE_TREE=""; }
+gate_tree() { # <sha> <worker>
+  local p; GATE_TREE="$GATE_DIR/tree-$$"
+  git -C "$FLEET/$2" worktree add -q --detach "$GATE_TREE" "$1" >&2 || { GATE_TREE=""; return 1; }
+  for p in $GATE_SHARED; do
+    [ -e "$FLEET/$2/$p" ] || continue
+    cp -Rc "$FLEET/$2/$p" "$GATE_TREE/$p" 2>/dev/null || cp -R "$FLEET/$2/$p" "$GATE_TREE/$p"
+  done
+}
+
+# One line on whether the branch on the remote is the code in the worker.
+push_fact() { # <dir> <branch>
+  git -C "$1" fetch -q "$BASE_REMOTE" "$2" 2>/dev/null || true
+  local up; up="$(git -C "$1" rev-parse -q --verify "refs/remotes/$BASE_REMOTE/$2")" \
+    || { echo "not pushed"; return; }
+  [ "$up" = "$(git -C "$1" rev-parse HEAD)" ] && { echo "pushed at HEAD"; return; }
+  echo "$BASE_REMOTE/$2 is not HEAD ($(git -C "$1" rev-list --count "$up..HEAD") local commit(s) not pushed)"
+}
+
+# The last gate on a record, and whether it still covers the worker's code.
+gate_fact() { # <bead> <dir>
+  local g; g="$(bead_field "$1" .metadata.gate)"
+  [ -n "$g" ] || { echo "no gate run recorded"; return; }
+  local s="the code has changed since — rerun it"
+  [ "$(bead_field "$1" .metadata.gate_tree)" = "$(tree_id "$2")" ] && s="covers this exact code"
+  echo "$g vs $(bead_field "$1" .metadata.gate_base) — $s"
+}
+
+# --- commands ---------------------------------------------------------------
+
+cmd_init() {
+  mkdir -p "$LOCKS" "$FLEET/task-logs"
+  if [ -d "$BEADS_DIR" ]; then echo "task store already at $STORE"; return; fi
+  # bd init makes its own private git repo wherever it runs, so it gets its own
+  # subdirectory: the fleet root and the workers stay untouched.
+  mkdir -p "$STORE"
+  ( cd "$STORE" && unset BEADS_DIR && \
+    bd init --prefix "$BEADS_PREFIX" --skip-agents --skip-hooks --role maintainer --quiet ) \
+    || die "bd init failed"
+  echo "task store created at $STORE"
+}
+
+cmd_provision() {
+  [ "$WORKER_KIND" = worktree ] || die "provision only handles worktree fleets"
+  [ -n "$REPO" ] || die "REPO not set in fleet.conf"
+  mkdir -p "$LOCKS" "$FLEET/task-logs"
+  git -C "$REPO" fetch -q "$BASE_REMOTE" "$BASE_BRANCH"
+  local w
+  for w in main $WORKERS; do
+    if [ ! -e "$FLEET/$w/.git" ]; then
+      git -C "$REPO" worktree add --detach "$FLEET/$w" "$BASE_REF" && echo "provisioned $w/"
+    fi
+    [ "$w" != main ] && type fleet_provision_worker >/dev/null 2>&1 && fleet_provision_worker "$w"
+  done
+  refresh_reference
+}
+
+# One object per worker, for Fleet View: the engine is the only place that decides lock state.
+status_json() {
+  local w
+  for w in $WORKERS; do
+    jq -n --arg name "$w" --arg state "$(lock_state "$w")" --arg task "$(owner_get "$w" task)" \
+      --arg branch "$(owner_get "$w" branch)" --arg session "$(owner_get "$w" session)" \
+      --arg claimed_at "$(owner_get "$w" claimed_at)" --arg lease_until "$(owner_get "$w" lease_until)" \
+      --argjson dirty "$(dirty_count "$w")" \
+      '{name: $name, state: $state, dirty: $dirty} + ({task: $task, branch: $branch, session: $session,
+        claimed_at: $claimed_at, lease_until: $lease_until} | with_entries(select(.value != "")))'
+  done | jq -s '{workers: .}'
+}
+
+cmd_status() {
+  [ "${1:-}" = --json ] && { status_json; return; }
+  local w st task branch sess until left t hints=""; t="$(now)"
+  printf '%-10s %-11s %-12s %-36s %-10s %-8s %s\n' WORKER STATE TASK BRANCH SESSION LEASE DIRTY
+  for w in $WORKERS; do
+    st="$(lock_state "$w")"; task="-"; branch="-"; sess="-"; left="-"
+    if [ -f "$LOCKS/$w/owner" ]; then
+      task="$(owner_get "$w" task)"; branch="$(owner_get "$w" branch)"
+      sess="$(owner_get "$w" session | cut -c1-8)"; until="$(owner_get "$w" lease_until)"
+      if [ "$until" -gt "$t" ]; then left="$(( (until - t) / 60 ))m"; else left="over"; fi
+    fi
+    printf '%-10s %-11s %-12s %-36s %-10s %-8s %s\n' "$w" "$st" "$task" "$branch" "$sess" "$left" "$(dirty_count "$w")"
+    [ "$st" = INTERRUPTED ] && hints+="  $w: its session ended with $(dirty_count "$w") uncommitted file(s) for $task. Continue that conversation: claude --resume $(owner_get "$w" session) — or, in a new session: fleet claim $task"$'\n'
+  done
+  [ -n "$hints" ] && printf '\nInterrupted (never collected; resume to continue):\n%s' "$hints"
+  if [ -d "$BEADS_DIR" ]; then
+    echo
+    echo "Open task records (resume with: fleet claim <TASK>):"
+    # A record says "claimed" only while a live lock agrees; otherwise the agent left without releasing.
+    local ref state rest h
+    bdq list --label fleet-task --json | jq -r '
+      .[] | "\(.external_ref)\t\(.metadata.state // "?")\t\(.metadata.branch // "-")\t\(.title)"' \
+      | while IFS="$(printf '\t')" read -r ref state rest; do
+          if [ "$state" = claimed ] && ! { h="$(task_holder "$ref")" && [ "$(lock_state "$h")" = CLAIMED ]; }; then
+            state="stale-claim"
+          fi
+          printf '  %s\t%s\t%s\n' "$ref" "$state" "$rest"
+        done | column -t -s "$(printf '\t')" || true
+  fi
+}
+
+cmd_show() {
+  need_store
+  local id; id="$(task_bead "$1")"
+  [ -n "$id" ] || die "no open record for $1"
+  echo "task:    $1  ($id)"
+  echo "title:   $(bead_field "$id" .title)"
+  echo "state:   $(bead_field "$id" .metadata.state)"
+  echo "branch:  $(bead_field "$id" .metadata.branch)"
+  echo "worker:  $(bead_field "$id" .metadata.worker) (last)"
+  echo "--- notes"
+  bead_field "$id" .notes
+}
+
+# Move a gone claim's lock to this session. The rename is atomic: only one agent wins.
+take_over() { # <worker> <state>
+  local w="$1" o="$LOCKS/.reclaim-$1-$$" old oldbead oldsess
+  mv "$LOCKS/$w" "$o" 2>/dev/null || return 1
+  old="$(sed -n 's/^task=//p' "$o/owner")"; oldbead="$(sed -n 's/^bead=//p' "$o/owner")"
+  oldsess="$(sed -n 's/^session=//p' "$o/owner")"
+  mkdir "$LOCKS/$w" 2>/dev/null || { rm -rf "$o"; return 1; }
+  # An adopted worker keeps the old owner file until claim writes its own, so a claim that
+  # fails halfway leaves it INTERRUPTED (still resumable), not free with someone's work in it.
+  [ "$2" = INTERRUPTED ] && mv "$o/owner" "$LOCKS/$w/owner"
+  rm -rf "$o"
+  if [ "$2" = INTERRUPTED ]; then
+    [ -n "$oldbead" ] && bdq note "$oldbead" "[$(iso "$(now)")] worker $w adopted with its uncommitted work by $SESSION (session $oldsess had ended)" >/dev/null
+    warn "adopted $w from the ended session $oldsess, uncommitted work included (that conversation: claude --resume $oldsess)"
+    return 0
+  fi
+  # Nobody holds the old task any more: say so in its record, or it reads "claimed" forever.
+  if [ -n "$oldbead" ]; then
+    bdq note "$oldbead" "[$(iso "$(now)")] worker $w taken over from a $2 claim by $SESSION" >/dev/null
+    bdq update "$oldbead" --status open --set-metadata "state=paused" >/dev/null
+  fi
+  warn "took over $w from a $2 claim on ${old:-?} (its record and branch are kept)"
+}
+
+# Take the lock on a worker that is FREE, or DEAD/EXPIRED with a clean tree, or INTERRUPTED
+# when its uncommitted work belongs to <task>: resuming after a crash picks up where it stopped.
+try_lock() { # <worker> [task]
+  local w="$1" st; st="$(lock_state "$w")"
+  case "$st" in
+    FREE) mkdir "$LOCKS/$w" 2>/dev/null || return 1 ;;
+    INTERRUPTED)
+      [ -n "${2:-}" ] && [ "$(owner_get "$w" task)" = "$2" ] && { take_over "$w" "$st"; return; }
+      warn "$w is INTERRUPTED with uncommitted work for $(owner_get "$w" task) — skipped (resume that task, or fleet reclaim $w --salvage)"
+      return 1 ;;
+    DEAD|EXPIRED)
+      [ "$(dirty_count "$w")" = 0 ] || { warn "$w is $st but has uncommitted work — skipped (fleet reclaim $w --salvage)"; return 1; }
+      take_over "$w" "$st" || return 1
+      git -C "$FLEET/$w" checkout -q --detach 2>/dev/null || true
+      ;;
+    *) return 1 ;;
+  esac
+  if [ "$(dirty_count "$w")" != 0 ]; then
+    warn "$w is free but has uncommitted work — skipped; inspect it"
+    rmdir "$LOCKS/$w"; return 1
+  fi
+  return 0
+}
+
+cmd_claim() {
+  need_store
+  local task="" branch="" title="" fresh=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch) branch="$2"; shift 2 ;;
+      --title)  title="$2"; shift 2 ;;
+      --fresh)  fresh=1; shift ;;
+      -*) die "unknown option $1" ;;
+      *)  task="$1"; shift ;;
+    esac
+  done
+  [ -n "$task" ] || die "claim needs a task key"
+  echo "$task" | grep -Eq "$TASK_KEY_PATTERN" || die "task key '$task' does not match $TASK_KEY_PATTERN"
+
+  local holder
+  if holder="$(task_holder "$task")"; then
+    case "$(lock_state "$holder")" in
+      CLAIMED)
+        [ "$(owner_get "$holder" session)" = "$SESSION" ] \
+          && { echo "already yours: $holder"; echo "WORKER=$holder"; echo "DIR=$FLEET/$holder"; return; }
+        die "$task is being worked right now in $holder by session $(owner_get "$holder" session)" ;;
+    esac
+  fi
+
+  local repo_git="$FLEET/main"; [ -e "$repo_git/.git" ] || repo_git="$REPO"
+  local id prev_branch="" prev_worker="" mode=new
+  id="$(task_bead "$task")"
+  if [ -n "$id" ]; then
+    prev_branch="$(bead_field "$id" .metadata.branch)"
+    prev_worker="$(bead_field "$id" .metadata.worker)"
+    mode=resume
+  fi
+
+  if [ "$fresh" = 1 ] && [ -n "$id" ]; then
+    # Flush the record without destroying anything: close it, park the branch.
+    local stamp; stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    if [ -n "$holder" ]; then
+      [ "$(dirty_count "$holder")" = 0 ] || die "--fresh: $holder still has uncommitted work for $task (fleet reclaim $holder --salvage)"
+      git -C "$FLEET/$holder" checkout -q --detach 2>/dev/null || true
+      unlock "$holder"
+    fi
+    if [ "$WORKER_KIND" = worktree ] && [ -n "$prev_branch" ] && \
+       git -C "$repo_git" show-ref --verify --quiet "refs/heads/$prev_branch"; then
+      git -C "$repo_git" branch -m "$prev_branch" "salvage/$prev_branch-$stamp" \
+        && echo "parked old branch as salvage/$prev_branch-$stamp"
+    fi
+    bdq close "$id" --reason "start-fresh $stamp by $SESSION" >/dev/null
+    echo "flushed record $id for $task"
+    [ -z "$branch" ] && branch="$prev_branch"
+    id=""; prev_worker=""; mode=fresh
+  fi
+
+  [ "$mode" = resume ] && branch="$prev_branch"
+  [ -n "$branch" ] || die "new task: pass --branch <name>"
+
+  local w worker=""
+  for w in $holder $prev_worker $WORKERS; do   # the task's own interrupted worker first
+    is_worker "$w" || continue
+    if try_lock "$w" "$task"; then worker="$w"; break; fi
+  done
+  [ -n "$worker" ] || die "all workers busy — see: fleet -f $FLEET status"
+
+  # From here on, any failure must give the lock back.
+  local dir="$FLEET/$worker" how=""
+  fail() { [ -f "$LOCKS/$worker/owner" ] || unlock "$worker"; die "$*"; }   # an adopted worker stays INTERRUPTED
+
+  git -C "$dir" fetch -q "$BASE_REMOTE" "$BASE_BRANCH" || fail "fetch failed"
+  git -C "$dir" fetch -q "$BASE_REMOTE" "$branch" 2>/dev/null || true
+
+  if git -C "$dir" show-ref --verify --quiet "refs/heads/$branch"; then
+    [ "$mode" = resume ] || fail "branch $branch already exists but $task has no record — pick another --branch"
+    git -C "$dir" switch -q "$branch" || fail "could not switch to $branch (checked out in another worker?)"
+    how="existing local branch"
+  elif git -C "$dir" show-ref --verify --quiet "refs/remotes/$BASE_REMOTE/$branch"; then
+    if [ "$mode" = resume ]; then
+      git -C "$dir" switch -q -c "$branch" --track "$BASE_REMOTE/$branch" || fail "could not track $BASE_REMOTE/$branch"
+      how="tracking $BASE_REMOTE/$branch"
+    else
+      fail "$BASE_REMOTE/$branch already exists on the remote — pick another --branch"
+    fi
+  else
+    [ "$mode" = resume ] && warn "recorded branch $branch is gone — starting it again from $BASE_REF"
+    git -C "$dir" checkout -q --detach "$BASE_REF" || fail "could not check out $BASE_REF"
+    git -C "$dir" switch -q -c "$branch" || fail "could not create $branch"
+    how="new from $BASE_REF"
+  fi
+
+  if [ -z "$id" ]; then
+    id="$(bdq create "${title:-$task}" --external-ref "$task" -l fleet-task \
+          -d "Fleet task record for $task" --silent)"
+    [ -n "$id" ] || fail "could not create the task record"
+  fi
+  bdq update "$id" --status in_progress --set-metadata "branch=$branch" \
+      --set-metadata "worker=$worker" --set-metadata "state=claimed" >/dev/null
+  bdq note "$id" "[$(iso "$(now)")] claimed ($mode) in $worker by $SESSION" >/dev/null
+  owner_write "$worker" "$task" "$id" "$branch"
+  refresh_reference
+
+  echo "WORKER=$worker"
+  echo "DIR=$dir"
+  echo "BRANCH=$branch ($how)"
+  echo "MODE=$mode"
+  echo "LEASE_UNTIL=$(iso "$(owner_get "$worker" lease_until)")"
+  if [ "$mode" = resume ]; then
+    echo
+    echo "=== Where the last agent left off ==="
+    echo "--- notes: what earlier agents wrote. These are claims, not facts — check each one"
+    echo "--- against the evidence below before you build on it. [gate]/[fleet] lines are written by fleet."
+    bead_field "$id" .notes
+    local gb; gb="$(gate_base "$dir")"; gb="${gb%% *}"
+    echo
+    echo "=== Evidence (from git and the gate, not from any agent) ==="
+    echo "--- last gate: $(gate_fact "$id" "$dir")"
+    echo "--- remote: $(push_fact "$dir" "$branch")"
+    echo "--- commits on $branch since its merge-base"
+    git -C "$dir" log --oneline "${gb:-$BASE_REF}..HEAD" | head -30
+    echo "--- files changed since its merge-base"
+    git -C "$dir" diff --stat "${gb:-$BASE_REF}" | tail -40
+  fi
+  review_open "$task"
+  if [ "$BRIEF_REQUIRED" = 1 ]; then
+    echo
+    if brief_ok "$task"; then echo "=== Brief agreed with the user: $BRIEFS/$task.md. Read it: it is the spec."
+    else brief_hint "$task"; fi
+  fi
+}
+
+cmd_renew() {
+  mine_or_die "$1"
+  owner_write "$1" "$(owner_get "$1" task)" "$(owner_get "$1" bead)" "$(owner_get "$1" branch)" "$(owner_get "$1" claimed_at)"
+  echo "lease on $1 until $(iso "$(owner_get "$1" lease_until)")"
+}
+
+cmd_note() {
+  local w="$1"; shift
+  [ $# -gt 0 ] || die "note needs text"
+  mine_or_die "$w"; need_store
+  bdq note "$(owner_get "$w" bead)" "[$(iso "$(now)")] $*" >/dev/null || die "could not write the note"
+  cmd_renew "$w"
+  review_open "$(owner_get "$w" task)"
+}
+
+cmd_gate() {
+  local w="${1:-}"; mine_or_die "$w"; need_store
+  [ -n "$GATE" ] || die "no GATE checks in $FLEET/fleet.conf"
+  local dir="$FLEET/$w" id tree base ref changed
+  id="$(owner_get "$w" bead)"
+  [ "$BRIEF_REQUIRED" != 1 ] || brief_ok "$(owner_get "$w" task)" \
+    || { brief_hint "$(owner_get "$w" task)"; die "no brief — grill the user first"; }
+  tree="$(tree_id "$dir")" || die "could not snapshot the code in $w"
+  read -r base ref <<<"$(gate_base "$dir")"
+  [ -n "$base" ] || die "$w shares no history with $BASE_REF $EXTRA_BASES"
+  changed="$(git -C "$dir" diff --name-only "$base"; git -C "$dir" ls-files --others --exclude-standard)"
+
+  local run="$GATE_DIR/run-$w" bdir="$GATE_DIR/base/$base" result=pass summary="" name kind paths cmd
+  local e be new fixed f
+  rm -rf "$run"; mkdir -p "$run" "$bdir"
+  trap "gate_tree_drop '$w'" EXIT
+  echo "gate: $w at tree ${tree:0:10}, base $ref @ ${base:0:10}"
+  while IFS='|' read -r name kind paths cmd; do
+    [ -n "$name" ] || continue
+    if ! touched "$changed" "$paths"; then
+      echo "  $name: skipped (nothing under $paths changed)"; summary+="$name skipped; "; continue
+    fi
+    echo "  $name: running ..."
+    gate_run "$dir" "$kind" "$cmd" "$run/$name"
+    # The same command on the merge-base, once per commit: the baseline is measured, never remembered.
+    if [ ! -f "$bdir/$name.exit" ]; then
+      [ -n "$GATE_TREE" ] || { echo "  (measuring the base: once per base commit)"; gate_tree "$base" "$w"; } \
+        || die "could not create a base worktree at $base"
+      gate_run "$GATE_TREE" "$kind" "$cmd" "$bdir/$name.$$"
+      for f in log exit sig; do [ -f "$bdir/$name.$$.$f" ] && mv "$bdir/$name.$$.$f" "$bdir/$name.$f"; done
+    fi
+    e="$(cat "$run/$name.exit")"; be="$(cat "$bdir/$name.exit")"
+    case "$kind" in
+      test)
+        if [ "$e" = 0 ]; then echo "  $name: ok"; summary+="$name ok; "
+        elif [ "$be" != 0 ]; then
+          # ponytail: exit codes only, so new failures inside a suite that already fails on the base
+          # pass unseen; compare failing test names if that starts to matter.
+          echo "  $name: FAILS, but fails on the base too (exit $be) — not caused by this branch; see $bdir/$name.log"
+          summary+="$name fails on base too; "
+        else
+          echo "  $name: FAIL (exit $e; passes on the base) — $run/$name.log"; summary+="$name FAIL; "; result=fail
+        fi ;;
+      typecheck)
+        if [ "$e" != 0 ] && [ ! -s "$run/$name.sig" ]; then
+          echo "  $name: FAIL — exited $e with no error lines matching GATE_ERROR_RE (crashed?) — $run/$name.log"
+          summary+="$name FAIL (no readable output); "; result=fail; continue
+        fi
+        new="$(LC_ALL=C comm -13 "$bdir/$name.sig" "$run/$name.sig")"
+        fixed="$(LC_ALL=C comm -23 "$bdir/$name.sig" "$run/$name.sig" | grep -c .)"
+        if [ -n "$new" ]; then
+          echo "  $name: FAIL — $(grep -c . <<<"$new") new error(s) vs the base ($fixed fixed):"
+          head -20 <<<"$new" | sed 's/^/      /'
+          summary+="$name FAIL $(grep -c . <<<"$new") new; "; result=fail
+        else
+          echo "  $name: ok — no new errors ($(grep -c . < "$run/$name.sig") here, $(grep -c . < "$bdir/$name.sig") on the base, $fixed fixed)"
+          summary+="$name ok, 0 new; "
+        fi ;;
+      *) die "GATE check $name: unknown kind '$kind' (test|typecheck)" ;;
+    esac
+  done <<<"$GATE"
+
+  bdq update "$id" --set-metadata "gate=$result" --set-metadata "gate_tree=$tree" \
+      --set-metadata "gate_base=$ref@${base:0:10}" >/dev/null
+  bdq note "$id" "[$(iso "$(now)")] [gate] $result on tree ${tree:0:10} vs $ref@${base:0:10}: $summary" >/dev/null
+  cmd_renew "$w" >/dev/null
+  echo "gate: $result — logs in $run"
+  [ "$result" = pass ]
+}
+
+REVIEW_SCHEMA='{"type":"object","required":["verdict","summary","findings"],"properties":{
+ "verdict":{"enum":["approve","changes_requested"]},"summary":{"type":"string"},
+ "findings":{"type":"array","items":{"type":"object","required":["severity","axis","file","text"],"properties":{
+  "severity":{"enum":["blocking","should","nit"]},
+  "axis":{"enum":["spec","standards","ponytail","claims","existence"]},
+  "file":{"type":"string"},"line":{"type":"integer"},"text":{"type":"string"},"evidence":{"type":"string"}}}}}}'
+REVIEW_TOOLS="Read,Grep,Glob,Skill,Agent,Task,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git ls-files:*),Bash(git rev-parse:*),Bash(git merge-base:*),Bash(git grep:*),Bash(rg:*),Bash(grep:*),Bash(ls:*),Bash(wc:*)"
+
+# A fresh, read-only Claude that never saw the author's reasoning reviews the change
+# against the brief. Its blocking/should findings become review comments, which the
+# author must fix or answer; release --state review checks both.
+cmd_review() {
+  local w="${1:-}"; mine_or_die "$w"; need_store
+  [ "$REVIEW_ROUNDS" -gt 0 ] || die "reviews are off — set REVIEW_ROUNDS in $FLEET/fleet.conf"
+  local dir="$FLEET/$w" id task tree base ref r
+  id="$(owner_get "$w" bead)"; task="$(owner_get "$w" task)"
+  [ "$BRIEF_REQUIRED" != 1 ] || brief_ok "$task" || { brief_hint "$task"; die "no brief to review against"; }
+  tree="$(tree_id "$dir")" || die "could not snapshot the code in $w"
+  if [ -n "$GATE" ]; then
+    [ "$(bead_field "$id" .metadata.gate)" = pass ] && [ "$(bead_field "$id" .metadata.gate_tree)" = "$tree" ] \
+      || die "run a passing fleet gate $w on this code first: the reviewer's time goes on what tools can't check"
+  fi
+  r="$(bead_field "$id" .metadata.review_round)"; r=$(( ${r:-0} + 1 ))
+  [ "$r" -le "$REVIEW_ROUNDS" ] || die "$REVIEW_ROUNDS review rounds done — this goes to a human now: answer every open comment in $REVIEWS/$task.md, then release --state review"
+  read -r base ref <<<"$(gate_base "$dir")"
+
+  local out="$GATE_DIR/review/$task" brief="$BRIEFS/$task.md" prompt so
+  mkdir -p "$out"
+  prompt="You are an independent reviewer for task $task in a fleet of coding agents. You did not write
+this change and have none of its author's context: trust only what you can check in this repository.
+You are non-interactive: never ask a question; anything missing is a finding. Do not change any file.
+
+Inputs
+- Spec: the brief the author agreed with the user, at $brief (it includes the ticket):
+$(cat "$brief" 2>/dev/null || echo "(no brief file — review against the task title: $(bead_field "$id" .title))")
+- Fixed point: $base (merge-base with $ref). The change is \`git diff $base\`. Use that two-dot form,
+  not \`...HEAD\`: it includes uncommitted work. New files: \`git ls-files --others --exclude-standard\`.
+- The author's notes. These are claims, not facts; lines tagged [gate]/[fleet] were written by the harness:
+$(bead_field "$id" .notes)
+- Review comments so far (from the user and earlier rounds), with the author's replies:
+$(cat "$REVIEWS/$task.md" 2>/dev/null || echo "(none)")
+- Gate: already run by the harness on this exact code, do not re-run it: $(gate_fact "$id" "$dir")
+
+Do all four, then return the JSON:
+1. Run the Skill mattpocock-skills:code-review with fixed point $base and the brief above as the spec.
+2. Run the Skill ponytail:ponytail-review on the same diff.
+3. Claims: for every claim in the author's notes, find the evidence (file:line, commit, command output)
+   or report it as unsupported.
+4. Existence: for every function, import, module, config key, route or file the diff relies on, confirm
+   it exists (grep, Read). Something that does not exist is blocking.
+
+Severity: blocking = wrong, unsafe, misses something the brief requires, relies on something that does
+not exist, or a note claims something false. should = breaks a documented standard, scope creep, or
+over-engineering with a concrete cut. nit = judgement-call smells and style.
+Do not repeat a comment that already has a reply unless the reply does not hold up; then say why.
+Every finding needs a file (or \"(general)\"), a line where possible, and evidence: quote the hunk,
+the brief line or the command output. verdict = approve only if there are no blocking findings."
+
+  echo "review: round $r of $REVIEW_ROUNDS on tree ${tree:0:10} vs $ref @ ${base:0:10} (this takes minutes)"
+  ( cd "$dir" && perl -e 'alarm shift; exec @ARGV' "$((REVIEW_TIMEOUT_MIN * 60))" \
+      "$REVIEW_BIN" -p "$prompt" --output-format json --json-schema "$REVIEW_SCHEMA" \
+      --allowedTools "$REVIEW_TOOLS" --disallowedTools "Edit,Write,MultiEdit,NotebookEdit" \
+      --add-dir "$BRIEFS" ${REVIEW_MODEL:+--model "$REVIEW_MODEL"} ) > "$out/round-$r.json" 2> "$out/round-$r.err"
+  so="$(jq -c '.structured_output // empty' "$out/round-$r.json" 2>/dev/null)"
+  [ -n "$so" ] || die "the reviewer returned no verdict — see $out/round-$r.json and $out/round-$r.err (round not counted)"
+
+  jq -r --arg r "$r" '"# \($r): \(.verdict)\n\n\(.summary)\n\n" + ([.findings[]
+    | "- **\(.severity)** [\(.axis)] \(.file)\(if .line then ":\(.line)" else "" end): \(.text)"
+      + (if .evidence then "\n  evidence: \(.evidence)" else "" end)] | join("\n"))' <<<"$so" > "$out/round-$r.md"
+
+  # Blocking and should findings join the user's comments, in Fleet View's format.
+  local rf="$REVIEWS/$task.md"
+  mkdir -p "$REVIEWS"
+  [ -f "$rf" ] || printf '# Review: %s\n\n<!-- Written by Fleet View and fleet review. Agent holding %s: address each "- [ ]" item,\nchange it to "- [x]", and add an indented "> " line under it saying what you did. Keep the\n"## file:line" headings as they are. -->\n' "$task" "$task" > "$rf"
+  jq -r --arg who "Reviewer round $r" --arg at "$(date -u '+%Y-%m-%d %H:%M')" '.findings[] | select(.severity != "nit")
+    | "\n## \(if (.file // "") == "" then "(general)" else .file end)\(if .line then ":\(.line)" else "" end)\n- [ ] \(.severity) (\(.axis)): \(.text | gsub("\n"; " ")) — \($who) · \($at)"
+      + (if .evidence then "\n  evidence: \(.evidence | gsub("\n"; " "))" else "" end)' <<<"$so" >> "$rf"
+
+  local nb ns nn verdict session
+  nb="$(jq '[.findings[] | select(.severity == "blocking")] | length' <<<"$so")"
+  ns="$(jq '[.findings[] | select(.severity == "should")] | length' <<<"$so")"
+  nn="$(jq '[.findings[] | select(.severity == "nit")] | length' <<<"$so")"
+  verdict="$(jq -r .verdict <<<"$so")"; session="$(jq -r '.session_id // "-"' "$out/round-$r.json")"
+  bdq update "$id" --set-metadata "review_round=$r" --set-metadata "review_tree=$tree" \
+      --set-metadata "review_blocking=$nb" --set-metadata "review_verdict=$verdict" >/dev/null
+  bdq note "$id" "[$(iso "$(now)")] [review] round $r: $verdict, $nb blocking, $ns should, $nn nit on tree ${tree:0:10}; report $out/round-$r.md; reviewer session $session" >/dev/null
+  cmd_renew "$w" >/dev/null
+
+  cat "$out/round-$r.md"
+  echo
+  echo "review: $verdict — $nb blocking, $ns should (added to $rf), $nn nit (report only)"
+  [ "$nb" = 0 ] || echo "review: fix or answer each comment, then: fleet gate $w && fleet review $w (round $((r + 1)) of $REVIEW_ROUNDS)"
+  [ "$nb" = 0 ]
+}
+
+cmd_release() {
+  local w="${1:-}"; shift || true
+  local state="" note="" wip=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --state) state="$2"; shift 2 ;;
+      --note)  note="$2"; shift 2 ;;
+      --wip)   wip=1; shift ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  mine_or_die "$w"; need_store
+  case "$state" in paused|review|done) ;; *) die "release needs --state paused|review|done" ;; esac
+  [ "$state" != paused ] || [ -n "$note" ] || die "--state paused needs --note: what is done, what is next"
+
+  local dir="$FLEET/$w" id task branch
+  id="$(owner_get "$w" bead)"; task="$(owner_get "$w" task)"; branch="$(owner_get "$w" branch)"
+  # "Ready for review" is a claim fleet checks: a gate passed on exactly this code.
+  if [ "$state" = review ] && [ -n "$GATE" ]; then
+    local g; g="$(bead_field "$id" .metadata.gate)"
+    [ -n "$g" ] || die "no gate run for $task — run: fleet gate $w"
+    [ "$(bead_field "$id" .metadata.gate_tree)" = "$(tree_id "$dir")" ] \
+      || die "the code in $w changed since the last gate — run: fleet gate $w"
+    [ "$g" = pass ] || die "the last gate failed — fix it, or release with --state paused and say why"
+  fi
+  # ... and an independent reviewer passed it too, until the rounds run out and a human takes over.
+  if [ "$state" = review ] && [ "$REVIEW_ROUNDS" -gt 0 ]; then
+    local rr rb; rr="$(bead_field "$id" .metadata.review_round)"; rr="${rr:-0}"
+    if [ "$rr" -lt "$REVIEW_ROUNDS" ]; then
+      [ "$rr" != 0 ] || die "no independent review yet — run: fleet review $w"
+      [ "$(bead_field "$id" .metadata.review_tree)" = "$(tree_id "$dir")" ] \
+        || die "the code changed since the last review — run: fleet gate $w && fleet review $w"
+      rb="$(bead_field "$id" .metadata.review_blocking)"
+      [ "${rb:-1}" = 0 ] || die "the last review found $rb blocking issue(s) — fix them, then fleet gate $w && fleet review $w (round $((rr + 1)) of $REVIEW_ROUNDS)"
+    fi
+  fi
+  if [ "$state" = review ]; then
+    local un; un="$(review_unanswered "$task")"
+    [ "$un" = 0 ] || die "$un review comment(s) in $REVIEWS/$task.md have no reply — fix each and tick it, or answer it with an indented '> why'"
+  fi
+  if [ "$(dirty_count "$w")" != 0 ]; then
+    [ "$wip" = 1 ] || die "$w has uncommitted work — commit it, or pass --wip to commit it as a wip commit"
+    git -C "$dir" add -A && git -C "$dir" commit -q --no-verify -m "wip($task): $state handoff" \
+      || die "wip commit failed"
+  fi
+
+  [ -n "$note" ] && bdq note "$id" "[$(iso "$(now)")] HANDOFF ($state): $note" >/dev/null
+  # Facts next to the note, so a reader can check "pushed" or "gate green" against them.
+  bdq note "$id" "[$(iso "$(now)")] [fleet] at release: HEAD $(git -C "$dir" rev-parse --short HEAD), $(push_fact "$dir" "$branch"); gate: $(gate_fact "$id" "$dir")" >/dev/null
+  bdq update "$id" --set-metadata "state=$state" --set-metadata "worker=$w" \
+      --set-metadata "head=$(git -C "$dir" rev-parse --short HEAD)" >/dev/null
+  if [ "$state" = done ]; then
+    bdq close "$id" --reason "done by $SESSION" >/dev/null
+  else
+    bdq update "$id" --status open >/dev/null
+  fi
+
+  # Let go of the branch so any worker can pick the task up next time.
+  [ "$WORKER_KIND" = worktree ] && git -C "$dir" checkout -q --detach
+  git -C "$dir" fetch -q "$BASE_REMOTE" "$BASE_BRANCH" 2>/dev/null || true
+  refresh_reference
+  unlock "$w"
+  echo "released $w — $task is $state on $branch"
+}
+
+cmd_reclaim() {
+  local w="${1:-}"; shift || true
+  local salvage=0 legacy=0
+  while [ $# -gt 0 ]; do
+    case "$1" in --salvage) salvage=1 ;; --legacy) legacy=1 ;; *) die "unknown option $1" ;; esac; shift
+  done
+  is_worker "$w" || die "unknown worker: $w"
+  local st; st="$(lock_state "$w")"
+  case "$st" in
+    FREE) echo "$w is already free"; return ;;
+    CLAIMED) die "$w has a live claim (session $(owner_get "$w" session)) — not reclaiming" ;;
+    LEGACY) [ "$legacy" = 1 ] || die "$w was claimed the old way (no owner file); confirm nobody is in it, then pass --legacy" ;;
+  esac
+  local dir="$FLEET/$w" task; task="$(owner_get "$w" task 2>/dev/null || true)"
+  if [ "$(dirty_count "$w")" != 0 ]; then
+    [ "$salvage" = 1 ] || die "$w has uncommitted work — rerun with --salvage to commit it before freeing"
+    if ! git -C "$dir" symbolic-ref -q HEAD >/dev/null; then
+      git -C "$dir" switch -q -c "salvage/$w-$(date -u +%Y%m%dT%H%M%SZ)" || die "could not create a salvage branch"
+    fi
+    git -C "$dir" add -A && git -C "$dir" commit -q --no-verify -m "wip: salvage before reclaim${task:+ ($task)}" \
+      || die "salvage commit failed"
+    echo "salvaged onto $(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+  fi
+  if [ -n "$task" ] && [ -d "$BEADS_DIR" ]; then
+    local id; id="$(owner_get "$w" bead)"
+    bdq note "$id" "[$(iso "$(now)")] worker $w reclaimed from a $st claim by $SESSION" >/dev/null
+    bdq update "$id" --status open --set-metadata "state=paused" >/dev/null
+  fi
+  [ "$WORKER_KIND" = worktree ] && git -C "$dir" checkout -q --detach 2>/dev/null
+  rm -f "$LOCKS/$w/owner"; rmdir "$LOCKS/$w" || die "could not remove $LOCKS/$w (unexpected files inside)"
+  echo "reclaimed $w${task:+ — $task stays resumable}"
+}
+
+# Where a branch tip landed: "merged <base>" when a base contains it and someone committed on
+# the branch (its reflog has a commit, merge, rebase, cherry-pick or revert), "empty <base>"
+# when a base contains it but nothing was ever committed on it, nothing when no base does.
+# Ancestry alone cannot tell the two apart: a branch nobody committed on is "merged" too.
+# ponytail: reflogs expire (90 days by default) and a branch made by reset has none, so those
+# read as "empty" and go to a human rather than being closed.
+landed() { # <git-dir> <branch> <tip>
+  local b
+  for b in $BASE_REF $EXTRA_BASES; do
+    git -C "$1" merge-base --is-ancestor "$3" "$b" 2>/dev/null || continue
+    if git -C "$1" reflog show --format=%gs "refs/heads/$2" 2>/dev/null | grep -Eq '^(commit|merge|rebase|cherry-pick|revert)'; then
+      echo "merged $b"
+    else echo "empty $b"; fi
+    return
+  done
+}
+
+# Bookkeeping that no longer matches the world. Rows: kind, key, action, reason, record id.
+#   free      a worker whose session ended with a clean tree (its record and branch are kept)
+#   close     a record whose branch is merged into a base and that nobody holds
+#   pause     a record that says claimed while no worker holds it
+#   resume    an INTERRUPTED worker: never collected, listed so someone picks it back up
+#   needs-you anything the script cannot judge safely
+# It reads remote refs as the last claim or release fetched them; it never fetches itself.
+cmd_gc() {
+  local apply=0 json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in --apply) apply=1 ;; --json) json=1 ;; *) die "unknown option $1" ;; esac; shift
+  done
+  need_store
+  local repo_git="$FLEET/main"; [ -e "$repo_git/.git" ] || repo_git="$REPO"
+  local rows="" live=" " w st task sess
+  row() { rows+="$1"$'\t'"$2"$'\t'"$3"$'\t'"$4"$'\t'"${5:-}"$'\n'; }
+
+  for w in $WORKERS; do
+    st="$(lock_state "$w")"; task="$(owner_get "$w" task)"; sess="$(owner_get "$w" session)"
+    case "$st" in
+      DEAD) row worker "$w" free "session ${sess:0:8} ended and the tree is clean; ${task:-its task} stays resumable" ;;
+      INTERRUPTED) live+="$task "
+        row worker "$w" resume "session ${sess:0:8} ended with $(dirty_count "$w") uncommitted file(s) for $task: claude --resume $sess, or fleet claim $task" ;;
+      LEGACY) row worker "$w" needs-you "lock with no owner file: check nobody is in it, then fleet reclaim $w --legacy" ;;
+      CLAIMED|EXPIRED) live+="$task " ;;
+    esac
+  done
+
+  local id ref state branch tip where
+  while IFS=$'\t' read -r id ref state branch; do
+    [ -n "$id" ] || continue
+    case "$live" in *" $ref "*) continue ;; esac
+    [ "$branch" = - ] && branch=""
+    tip="$(git -C "$repo_git" rev-parse -q --verify "refs/heads/$branch" 2>/dev/null \
+        || git -C "$repo_git" rev-parse -q --verify "refs/remotes/$BASE_REMOTE/$branch" 2>/dev/null)"
+    if [ -z "$branch" ] || [ -z "$tip" ]; then
+      row record "$ref" needs-you "branch ${branch:-?} is gone, locally and on $BASE_REMOTE" "$id"; continue
+    fi
+    where="$(landed "$repo_git" "$branch" "$tip")"
+    case "$where" in
+      merged*) row record "$ref" close "$branch is merged into ${where#merged }" "$id" ;;
+      empty*)  row record "$ref" needs-you "$branch has no commits of its own on ${where#empty } (review-only, or never started?)" "$id" ;;
+      *) [ "$state" = claimed ] && row record "$ref" pause "says claimed, but no worker holds it" "$id" ;;
+    esac
+  done < <(bdq list --label fleet-task -n 0 --json | jq -r '.[] | [.id, .external_ref, (.metadata.state // "-"), (.metadata.branch // "-")] | @tsv')
+  while IFS=$'\t' read -r id ref; do
+    [ -n "$id" ] && row record "$ref" needs-you "closed, but its metadata still says claimed" "$id"
+  done < <(bdq list --label fleet-task --all -n 0 --json | jq -r '.[] | select(.status == "closed" and .metadata.state == "claimed") | [.id, .external_ref] | @tsv')
+
+  if [ "$json" = 1 ]; then
+    jq -R -s 'split("\n") | map(select(. != "") | split("\t") | {kind: .[0], key: .[1], action: .[2], reason: .[3], id: .[4]}) | {rows: .}' <<<"$rows"
+  elif [ -z "$rows" ]; then echo "fleet gc: nothing to collect"
+  else
+    [ "$apply" = 1 ] || echo "fleet gc: report only — rerun with --apply to free, close and pause"
+    printf '%s' "$rows" | awk -F'\t' '{printf "  %-10s %-30s %s\n", $3, $2, $4}'
+  fi
+  [ "$apply" = 1 ] || return 0
+
+  local kind key action reason
+  while IFS=$'\t' read -r kind key action reason id; do
+    case "$action" in
+      free) ( cmd_reclaim "$key" ) ;;
+      close)
+        bdq note "$id" "[$(iso "$(now)")] [fleet] gc: $reason" >/dev/null
+        bdq update "$id" --set-metadata "state=done" >/dev/null
+        bdq close "$id" --reason "gc: $reason (by $SESSION)" >/dev/null && echo "closed $key — $reason" ;;
+      pause)
+        # a reclaim above may have paused it already
+        [ "$(bead_field "$id" .metadata.state)" = claimed ] || continue
+        bdq note "$id" "[$(iso "$(now)")] [fleet] gc: $reason — paused" >/dev/null
+        bdq update "$id" --status open --set-metadata "state=paused" >/dev/null && echo "paused $key" ;;
+    esac
+  done <<<"$rows"
+}
+
+cmd="${1:-status}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  init)      cmd_init ;;
+  provision) cmd_provision ;;
+  status)    cmd_status "$@" ;;
+  gc)        cmd_gc "$@" ;;
+  show)      cmd_show "${1:?show needs a task key}" ;;
+  claim)     cmd_claim "$@" ;;
+  note)      cmd_note "${1:?note needs a worker}" "${@:2}" ;;
+  renew)     cmd_renew "${1:?renew needs a worker}" ;;
+  gate)      cmd_gate "${1:?gate needs a worker}" ;;
+  review)    cmd_review "${1:?review needs a worker}" ;;
+  release)   cmd_release "$@" ;;
+  reclaim)   cmd_reclaim "$@" ;;
+  *) die "unknown command: $cmd" ;;
+esac

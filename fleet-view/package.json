@@ -1,0 +1,37 @@
+{
+  "name": "fleet-view",
+  "displayName": "Fleet View",
+  "description": "Live view of ~/.claude/fleet fleets: workers, sessions, changes, diagrams and review comments.",
+  "version": "0.3.0",
+  "publisher": "local",
+  "engines": { "vscode": "^1.90.0" },
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished", "onWebviewPanel:fleetView.panel"],
+  "contributes": {
+    "views": {
+      "explorer": [{ "type": "webview", "id": "fleetView.sidebar", "name": "Fleet", "icon": "$(server-process)" }]
+    },
+    "commands": [
+      { "command": "fleetView.open", "title": "Fleet: Open Dashboard", "icon": "$(preview)" },
+      { "command": "fleetView.goTo", "title": "Fleet: Go to Worker…" },
+      { "command": "fleetView.openBrowser", "title": "Fleet: Open Dashboard in Browser" },
+      { "command": "fleetView.restartServer", "title": "Fleet: Restart Server" },
+      { "command": "fleetView.reply", "title": "Add review comment" }
+    ],
+    "menus": {
+      "commandPalette": [{ "command": "fleetView.reply", "when": "false" }],
+      "view/title": [{ "command": "fleetView.open", "when": "view == fleetView.sidebar", "group": "navigation" }],
+      "comments/commentThread/context": [
+        { "command": "fleetView.reply", "group": "inline", "when": "commentController == fleetView.review" }
+      ]
+    },
+    "configuration": {
+      "title": "Fleet View",
+      "properties": {
+        "fleetView.dir": { "type": "string", "default": "", "description": "One more fleet folder (holds fleet.conf) to show, besides the fleet the workspace is inside and the fleets under its folders." },
+        "fleetView.port": { "type": "number", "default": 7420, "description": "Port the first fleet's server asks for (127.0.0.1 only). Other fleets take a free port." },
+        "fleetView.openIn": { "type": "string", "enum": ["tab", "terminal"], "enumDescriptions": ["A Claude Code tab in this window", "claude --resume in a terminal"], "default": "tab", "description": "Where Open sends a session. ⌥-click Open for the other one." }
+      }
+    }
+  }
+}
