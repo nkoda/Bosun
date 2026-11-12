@@ -77,6 +77,7 @@ a { color: var(--link); text-decoration: none; cursor: pointer; } a:hover { text
 .main { overflow-y: auto; }
 .main-inner { max-width: 1180px; padding: 20px 28px 48px; }
 @media (max-width: 760px) { .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } .rail { max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--border); } .main-inner { padding: 16px; } }
+body.compact { background: var(--bg-2); } /* it sits in the side bar, so take the side bar's colour */
 body.compact .app { grid-template-columns: 1fr; grid-template-rows: 1fr; } body.compact .rail { max-height: none; } body.compact .main { display: none; } body.compact .rail { border: 0; background: transparent; }
 
 /* rail: each row is a main button plus its own trailing buttons, never buttons inside buttons */
@@ -537,7 +538,7 @@ async function drawMermaid(root) {
     catch (e) { el.innerHTML = `<pre class="mono muted">${esc(String(e.message || e).slice(0, 300))}</pre>`; }
   }
 }
-const q = s => '"' + String(s ?? '').replace(/["\n]/g, ' ').replace(/[<>]/g, '') + '"';
+const q = s => '"' + String(s ?? '').replace(/["\n|]/g, ' ').replace(/[<>]/g, '') + '"';
 
 function branchGraph(w) {
   const label = s => q(s).slice(1, -1).slice(0, 38);
@@ -568,6 +569,65 @@ function changeMap(w) {
   });
   out.push(`  style T stroke:${color(w.name).replace(/var\((.*)\)/, (_, v) => css(v))},stroke-width:3px`);
   return out.join('\n');
+}
+
+// ---------- agents: each session's subagents and SendMessage calls (gather.js agents()), drawn live.
+// The diagrams carry structure and status only, so they redraw when an agent starts, ends or messages,
+// not on every tool call; what an agent is doing right now is in the list.
+const AG = { running: ['loading', 'ok', 'Running'], done: ['pass-filled', 'ok', 'Done'], stopped: ['circle-slash', 'muted', 'Stopped'] };
+const peerName = to => to.replace(/^uds:.*?(\d+)\.sock$/, 'session pid $1');
+const strokeOf = name => color(name).replace(/var\((.*)\)/, (_, v) => css(v));
+// One worker's part of a flowchart: worker → session → agent (labelled with what it was asked), dotted = SendMessage.
+function teamLines(w, p, peers, onlyRunning) {
+  const si = w.sessionInfo || {}, all = si.agents || [], list = all.filter(a => !onlyRunning || a.status === 'running');
+  if (w.state === 'FREE') return [`  ${p}W[${q(`${w.name} · free`)}]:::idle`];
+  const out = [`  ${p}W[${q(`${w.name} · ${w.ticket || ''}`)}]`, `  style ${p}W stroke:${strokeOf(w.name)},stroke-width:3px`];
+  if (!si.session_id) return out;
+  const more = all.length - list.length;
+  out.push(`  ${p}W --- ${p}S([${q(`session ${si.session_id.slice(0, 8)}${more ? ` · ${more} finished` : ''}`)}]):::${w.phase?.key === 'working' ? 'running' : 'done'}`);
+  list.forEach((a, i) => out.push(`  ${p}S -->|${q(a.description.slice(0, 40))}| ${p}A${i}[${q(`${a.type} · ${AG[a.status][2]}`)}]:::${a.status}`));
+  for (const m of si.sent || []) {
+    if (!peers.has(m.to)) peers.set(m.to, `M${peers.size}`);
+    const i = list.findIndex(a => a.id === m.from);
+    out.push(`  ${i < 0 ? p + 'S' : p + 'A' + i} -.->|${q(m.summary.slice(0, 30))}| ${peers.get(m.to)}`);
+  }
+  return out;
+}
+function graphEnd(peers) {
+  return [...[...peers].map(([to, id]) => `  ${id}>${q(peerName(to).slice(0, 40))}]`),
+    `  classDef running stroke:${css('--ok')},stroke-width:3px`, `  classDef done stroke:${css('--fg-2')}`,
+    `  classDef stopped stroke:${css('--fg-2')},stroke-dasharray:4`, `  classDef idle stroke:${css('--border')},stroke-dasharray:4`,
+    `  classDef overlap stroke:${css('--warn')},stroke-width:2px`];
+}
+const teamGraph = w => { const peers = new Map(); return ['flowchart LR', ...teamLines(w, 'x', peers, false), ...graphEnd(peers)].join('\n'); };
+// The whole fleet: who holds which worker, their running agents, who messages whom, and files two workers share.
+function fleetGraph() {
+  const peers = new Map(), ws = ST.snap.workers, out = ['flowchart LR'];
+  ws.forEach((w, i) => out.push(...teamLines(w, `w${i}`, peers, true)));
+  ST.agg.overlaps.slice(0, 8).forEach((o, i) => {
+    out.push(`  O${i}[${q(o.file.split('/').pop())}]:::overlap`);
+    for (const n of o.workers) out.push(`  w${ws.findIndex(w => w.name === n)}W -.- O${i}`);
+  });
+  return [...out, ...graphEnd(peers)].join('\n');
+}
+function agentItem(a) {
+  const [icon, cls, label] = AG[a.status];
+  return `<div class="item">${ic(icon, cls + (a.status === 'running' ? ' codicon-modifier-spin' : ''))}<div style="min-width:0">
+      <div><b>${esc(a.description || a.type)}</b> <span class="muted small">${esc(a.type)}${a.background ? ' · background' : ''} · ${label}</span></div>
+      ${a.doing ? `<div class="mono small muted clamp">${ic('play')} ${esc(a.doing)}</div>` : ''}
+      <div class="quote"><span class="who">Asked</span><div class="tl-text" data-k="ag:${esc(a.id)}:p" title="Click to expand">${esc(a.prompt)}</div>
+      ${a.reply ? `<span class="who">Answered</span><div class="tl-text" data-k="ag:${esc(a.id)}:r" title="Click to expand">${esc(a.reply)}</div>` : ''}</div></div>
+    <span class="muted num small">${esc(ago(a.at))}</span></div>`;
+}
+function agentsSection(w) {
+  const si = w.sessionInfo || {}, list = si.agents || [], sent = si.sent || [];
+  if (!list.length && !sent.length) return '';
+  const run = list.filter(a => a.status === 'running').length;
+  return `<section><h2>Agents <span class="aside muted">${run} running · ${list.length - run} finished${sent.length ? ' · ' + plural(sent.length, 'message') : ''}</span></h2><div class="card">
+      <div class="card-b">${mmd(teamGraph(w))}</div>
+      <div class="list" style="border-top:1px solid var(--border)">${list.map(agentItem).join('')}
+      ${sent.slice().reverse().map(m => `<div class="item">${ic('mail', 'muted')}<div style="min-width:0"><div><b>${esc(m.from === 'session' ? 'Session' : list.find(a => a.id === m.from)?.description || m.from)}</b> <span class="muted">→ ${esc(peerName(m.to))}</span></div>
+        <div class="clamp small">${esc(m.summary)}</div></div><span class="muted num small">${esc(ago(m.at))}</span></div>`).join('')}</div></div></section>`;
 }
 
 // ---------- review guide: the big picture first, then a reading order that links into every diff.
@@ -757,7 +817,7 @@ function annText(text) {
   if (!m) return esc(text);
   return `<span class="pill pill-${m[1]}">${ic(INTENT[m[1]][0])} ${INTENT[m[1]][1]}</span> ${m[2] ? `<q class="aq">${esc(m[2])}</q> ` : ''}${esc(m[3])}`;
 }
-const sendPrompt = file => `Address the open review comments in ${file}. A comment tagged [inspect] wants you to look into it and explain, with no code change; [review] wants you to check it for problems and report what you find; [change] wants the change made (or a reason not to). For each: do that, then tick it "- [x]" and add an indented "> what you did" line.`;
+const sendPrompt = file => `Address the open review comments in ${file}. A comment tagged [inspect] wants you to look into it and explain, with no code change; [review] wants you to check it for problems and report what you find; [change] wants the change made (or a reason not to). For each: do that, then tick it "- [x]" and add an indented "> what you did" line. A ">> " line is a follow-up from me: answer the newest with another "> " line.`;
 function markAnnotations(md) {
   for (const [it, , m, draft] of annotations(md.dataset.t)) {
     const quote = (m[2] || '').slice(0, 80);
@@ -812,15 +872,23 @@ function wireDiagrams(root) {
 
 // One popover for diagram boxes, the selection button and the annotation form.
 const pop = () => document.getElementById('pop');
-let popActions = {};
+let popActions = {}, popAnchor = null;
 function popover(anchor, html, actions = {}) {
-  const p = pop(), r = anchor.getBoundingClientRect();
-  p.innerHTML = html; popActions = actions; p.hidden = false;
-  p.style.left = Math.max(8, Math.min(r.left, innerWidth - p.offsetWidth - 8)) + 'px';
-  p.style.top = (r.bottom + 6 + p.offsetHeight > innerHeight ? Math.max(8, r.top - p.offsetHeight - 6) : r.bottom + 6) + 'px';
+  const p = pop();
+  p.innerHTML = html; popActions = actions; popAnchor = anchor; p.hidden = false;
+  placePop();
   (p.querySelector('textarea') || p.querySelector('button'))?.focus({ preventScroll: true });
 }
-function closePop() { pop().hidden = true; popActions = {}; }
+// Also run on resize. An anchor a live repaint replaced has no box any more, so the popover stays where it is.
+function placePop() {
+  const p = pop(), r = popAnchor.getBoundingClientRect();
+  if (!r.width && !r.height) return;
+  p.style.left = Math.max(8, Math.min(r.left, innerWidth - p.offsetWidth - 8)) + 'px';
+  p.style.top = (r.bottom + 6 + p.offsetHeight > innerHeight ? Math.max(8, r.top - p.offsetHeight - 6) : r.bottom + 6) + 'px';
+}
+// Emptied, not just hidden: the next annotation would otherwise start with this one's text.
+function closePop() { pop().hidden = true; pop().innerHTML = ''; popActions = {}; popAnchor = null; }
+addEventListener('resize', () => { if (popAnchor) placePop(); document.getElementById('selbtn').hidden = true; });
 function annotate(task, anchor, quote, target) {
   let intent = 'review';
   const seg = () => Object.entries(INTENT).map(([k, [icon, label, what]]) => `<button class="seg seg-${k}" data-pop="intent-${k}" role="radio" aria-checked="${k === intent}" title="${what}">${ic(icon)} ${label}</button>`).join('');
@@ -936,6 +1004,7 @@ function overviewPage() {
   return `<div class="head"><div class="grow"><h1>${ic('bell')} Needs you</h1><p class="lede">${esc(s.name)} fleet · ${esc(fleetSummary())}</p></div></div>
     <section><div class="inbox">${cards.join('') || `<div class="card calm">${ic('pass-filled')}<span>Nothing needs you right now.${count('working') ? ` ${plural(count('working'), 'agent')} working.` : ''}</span></div>`}</div></section>
     <section><h2>Working</h2><div class="card list">${running.map(activityItem).join('') || '<div class="empty">No agent is working right now.</div>'}</div></section>
+    <section><h2>Fleet map <span class="aside muted">who holds each worker · running agents · messages · files two workers share</span></h2><div class="card"><div class="card-b">${mmd(fleetGraph())}</div></div></section>
     <section><h2>Fleet over time <span class="aside muted">${ST.changedAt ? 'last change ' + esc(ago(ST.changedAt)) : ''}</span></h2><div class="card">${scrubView()}</div></section>
     <section><div class="card"><details class="fold" data-k="areas"><summary>${ic('chevron-right')} Changes by area · ${plural(ST.agg.areas.length, 'area')} across all workers</summary><div class="card-b">${areaChart()}</div></details></div></section>
     <section><h2>Tickets</h2><div class="card"><table><tr><th>Ticket</th><th>State</th><th>Harness</th><th>Updated</th><th></th><th></th></tr>
@@ -1005,7 +1074,7 @@ function workerPage(w) {
   const cmt = ([it, i]) => `<div class="cmt ${it.done ? 'done' : ''}"><input type="checkbox" ${it.done ? 'checked' : ''} data-act="resolve" data-w="${esc(w.name)}" data-i="${i}" aria-label="${it.done ? 'Reopen' : 'Mark addressed'}" title="${it.done ? 'Reopen' : 'Mark addressed'}">
       <div>${!changed.has(it.file) || it.line ? `<div class="mono muted small"><a data-act="open" data-dir="${esc(w.dir)}" data-file="${esc(it.file)}">${changed.has(it.file) ? 'line ' + it.line : esc(it.file) + (it.line ? ':' + it.line : '')}</a></div>` : ''}
       <div class="text" style="white-space:pre-wrap">${annText(it.text)}</div>
-      ${it.replies.map(r => `<div class="reply">${ic('sparkle', 'muted')} ${esc(r)}</div>`).join('')}</div></div>`;
+      ${(it.thread || []).map(r => `<div class="reply">${ic(r.who === 'agent' ? 'sparkle' : 'account', 'muted')} ${esc(r.text)}</div>`).join('')}</div></div>`;
   // Drafts sit with the submitted comments, marked, until Submit review.
   const draftRow = ([d, i]) => `<div class="cmt draft"><button class="icon-btn" data-act="draft-remove" data-t="${esc(w.ticket)}" data-i="${i}" title="Delete this draft" aria-label="Delete this draft">${ic('trash')}</button>
       <div>${!changed.has(d.file) || d.line ? `<div class="mono muted small">${changed.has(d.file) ? 'line ' + d.line : esc(d.file) + (d.line ? ':' + d.line : '')}</div>` : ''}
@@ -1028,6 +1097,7 @@ function workerPage(w) {
       ${si.lastReply ? `<div class="item"><span class="muted">${ic('sparkle')}</span><div class="clamp clamp4">${esc(si.lastReply)}</div><span class="muted small">${w.phase?.key === 'working' ? 'working…' : 'agent'}</span></div>` : ''}
       ${!si.lastPrompt && !si.lastReply ? '<div class="empty">Nothing yet. The conversation shows up after the next prompt in this worker\'s session.</div>' : ''}
       ${sid && w.phase?.key !== 'working' ? `<div style="padding:0 12px 12px">${replyBox(sid, w.name)}</div>` : ''}</div></section>
+    ${agentsSection(w)}
     <section><h2>Changes and review <span class="aside">${w.ticket ? reviewControls(w.ticket) + `<button class="btn" data-act="comment" data-w="${esc(w.name)}">${ic('add')} Comment</button>` : ''}
         ${items.length ? `<button class="btn" data-act="open" data-dir="${esc(ST.snap.fleet)}" data-file="scratchpad/reviews/${esc(w.ticket)}.md">${ic('go-to-file')} Review file</button>` : ''}</span></h2>
       <div class="card files">
@@ -1137,10 +1207,10 @@ document.addEventListener('mouseup', e => {
     const sel = getSelection(), b = document.getElementById('selbtn'), text = sel.toString().trim();
     const at = sel.rangeCount ? sel.anchorNode?.parentElement : null, box = at?.closest('.md.guide, .peek');
     if (!box || text.length < 3 || at.closest('svg')) { b.hidden = true; return; }
-    const rect = sel.getRangeAt(0).getBoundingClientRect(), target = annotationTarget(at), task = box.dataset.t;
+    const range = sel.getRangeAt(0).cloneRange(), rect = range.getBoundingClientRect(), target = annotationTarget(at), task = box.dataset.t;
     b.hidden = false; b.innerHTML = `${ic('comment')} Annotate`;
     b.style.left = Math.min(rect.left, innerWidth - 120) + 'px'; b.style.top = Math.min(rect.bottom + 6, innerHeight - 40) + 'px';
-    b.onclick = () => { b.hidden = true; annotate(task, { getBoundingClientRect: () => rect }, text, target); };
+    b.onclick = () => { b.hidden = true; annotate(task, { getBoundingClientRect: () => range.getBoundingClientRect() }, text, target); };
   });
 });
 document.addEventListener('change', e => { if (e.target.matches('[data-switch]')) { act('switch-fleet', { dir: e.target.value }); e.target.value = CFG.fleet; } });

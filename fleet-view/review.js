@@ -4,8 +4,10 @@
 //   ## path/to/file.ts:42          (":42" optional = file-level)
 //   - [ ] comment text — Author · 2026-11-04 10:31
 //     > agent reply
+//     >> reviewer follow-up — Author · 2026-11-04 11:02
 //
-// Agents address an item by turning "[ ]" into "[x]" and adding "> " reply lines.
+// Agents address an item by turning "[ ]" into "[x]" and adding "> " reply lines. A reviewer
+// follow-up unticks it again; a last ">> ✔ complete" line is the reviewer closing it.
 // ponytail: line numbers are stored as written and drift as the code moves; anchor to a snippet if that bites.
 const fs = require('fs');
 const path = require('path');
@@ -17,7 +19,8 @@ const header = task => `# Review: ${task}
 
 <!-- Written by Fleet View. Agent holding ${task}: address each "- [ ]" item, change it
 to "- [x]", and add an indented "> " line under it saying what you did. Keep the
-"## file:line" headings as they are. -->
+"## file:line" headings as they are. A ">> " line is the reviewer following up: answer
+the newest one with another "> " line. -->
 `;
 
 function parse(text) {
@@ -26,13 +29,18 @@ function parse(text) {
   for (const l of String(text).split('\n')) {
     let m;
     if ((m = l.match(/^## (.+?)(?::(\d+))?\s*$/))) { loc = { file: m[1].trim(), line: m[2] ? +m[2] : null }; cur = null; }
-    else if (loc && (m = l.match(/^- \[([ xX])\] (.*)$/))) items.push(cur = { ...loc, done: m[1] !== ' ', text: m[2], replies: [] });
-    else if (cur && (m = l.match(/^\s+> ?(.*)$/))) cur.replies.push(m[1]);
-    else if (cur && /^\s+\S/.test(l)) cur.text += '\n' + l.trim();
+    else if (loc && (m = l.match(/^- \[([ xX])\] (.*)$/))) items.push(cur = { ...loc, done: m[1] !== ' ', text: m[2], replies: [], thread: [] });
+    else if (cur && (m = l.match(/^\s+>> ?(.*)$/))) cur.thread.push({ who: 'you', text: m[1] });
+    else if (cur && (m = l.match(/^\s+> ?(.*)$/))) { cur.replies.push(m[1]); cur.thread.push({ who: 'agent', text: m[1] }); }
+    else if (cur && /^\s+\S/.test(l)) cur.text += '\n' + l.trim().replace(/^\\>/, '>');
     else if (!l.trim()) cur = null;
   }
+  for (const it of items) it.complete = it.done && !!it.thread.at(-1)?.text.startsWith(COMPLETE);
   return items;
 }
+const COMPLETE = '✔ complete';
+// draft: not sent yet · open: the agent owes an answer · answered: the agent answered, your turn · complete: you closed it.
+const status = it => it.draft ? 'draft' : it.complete ? 'complete' : it.done || it.thread?.at(-1)?.who === 'agent' ? 'answered' : 'open';
 
 function read(fleet, task) {
   try { return parse(fs.readFileSync(reviewFile(fleet, task), 'utf8')); } catch { return []; }
@@ -41,9 +49,10 @@ function read(fleet, task) {
 function add(fleet, task, { file, line, text, author }) {
   const f = reviewFile(fleet, task);
   fs.mkdirSync(path.dirname(f), { recursive: true });
-  const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
-  const body = text.trim().split('\n').map((l, i) => (i ? '  ' : '') + l).join('\n');
-  const block = `\n## ${file}${line ? ':' + line : ''}\n- [ ] ${body} — ${author} · ${stamp}\n`;
+  // A blank line would end the item and a line starting with ">" would read as an agent reply,
+  // so blank lines are dropped and a leading ">" is written as "\>" (parse() turns it back).
+  const body = text.trim().split('\n').filter(l => l.trim()).map((l, i) => (i ? '  ' + l.replace(/^\s*>/, '\\>') : l)).join('\n');
+  const block = `\n## ${file}${line ? ':' + line : ''}\n- [ ] ${body} — ${author} · ${stamp()}\n`;
   fs.appendFileSync(f, fs.existsSync(f) ? block : header(task) + block);
   return f;
 }
@@ -54,6 +63,35 @@ function setDone(fleet, task, index, done) {
   let n = -1;
   const text = fs.readFileSync(f, 'utf8').replace(/^- \[([ xX])\] /gm, (m) => (++n === index ? `- [${done ? 'x' : ' '}] ` : m));
   fs.writeFileSync(f, text);
+}
+
+const stamp = () => new Date().toISOString().slice(0, 16).replace('T', ' ');
+// The n-th item's lines: its "- [ ]" line up to its last indented one.
+function editItem(fleet, task, index, fn) {
+  const f = reviewFile(fleet, task), lines = fs.readFileSync(f, 'utf8').split('\n');
+  let n = -1;
+  const start = lines.findIndex(l => /^- \[[ xX]\] /.test(l) && ++n === index);
+  if (start < 0) return;
+  let end = start + 1;
+  while (end < lines.length && /^\s+\S/.test(lines[end])) end++;
+  fn(lines, start, end);
+  fs.writeFileSync(f, lines.join('\n'));
+}
+// The conversation goes on under the item, and it goes back to the agent.
+function followUp(fleet, task, index, { text, author }) {
+  editItem(fleet, task, index, (lines, start, end) => {
+    const add = String(text).trim().split('\n').map(l => '  >> ' + l);
+    add[add.length - 1] += ` — ${author} · ${stamp()}`;
+    lines[start] = lines[start].replace(/^- \[[xX]\]/, '- [ ]');
+    lines.splice(end, 0, ...add);
+  });
+}
+// Reopening drops the mark, which leaves the item answered (your turn) rather than back with the agent.
+function setComplete(fleet, task, index, complete, author) {
+  editItem(fleet, task, index, (lines, start, end) => {
+    if (complete) { lines[start] = lines[start].replace(/^- \[ \]/, '- [x]'); lines.splice(end, 0, `  >> ${COMPLETE} — ${author} · ${stamp()}`); }
+    else if (lines[end - 1].trimStart().startsWith(`>> ${COMPLETE}`)) lines.splice(end - 1, 1);
+  });
 }
 
 // Drafts: comments a reviewer is still writing. They sit in <TASK>.draft.json, which the hook
@@ -82,7 +120,7 @@ function submit(fleet, task, { note, author } = {}) {
   return list.length;
 }
 
-module.exports = { reviewDir, reviewFile, parse, read, add, setDone, drafts, addDraft, removeDraft, submit };
+module.exports = { reviewDir, reviewFile, parse, read, status, add, setDone, followUp, setComplete, drafts, addDraft, removeDraft, submit };
 
 if (require.main === module) {
   const assert = require('assert');
@@ -101,6 +139,22 @@ if (require.main === module) {
   setDone(tmp, 'TASK-1', 1, true);
   setDone(tmp, 'TASK-1', 0, false);
   assert.deepStrictEqual(read(tmp, 'TASK-1').map(i => i.done), [false, true]);
+  // The four colours: answered (agent replied), a follow-up sends it back, then complete and reopen.
+  setDone(tmp, 'TASK-1', 0, true);
+  assert.deepStrictEqual(read(tmp, 'TASK-1').map(status), ['answered', 'answered']);
+  followUp(tmp, 'TASK-1', 0, { text: 'and Y too?', author: 'R' });
+  let it = read(tmp, 'TASK-1')[0];
+  assert.deepStrictEqual([status(it), it.replies, it.thread.map(t => t.who)], ['open', ['reused X in abc123'], ['agent', 'you']]);
+  setComplete(tmp, 'TASK-1', 0, true, 'R');
+  assert.deepStrictEqual(read(tmp, 'TASK-1').map(status), ['complete', 'answered']);
+  setComplete(tmp, 'TASK-1', 0, false, 'R');
+  assert.strictEqual(status(read(tmp, 'TASK-1')[0]), 'answered');
+  assert.strictEqual(status({ draft: true }), 'draft');
+  setDone(tmp, 'TASK-1', 0, false);
+  // A comment with paragraphs and a quoted line arrives whole, with no reply in it.
+  add(tmp, 'TASK-2', { file: 'a.js', line: 3, text: 'first para\n\nsecond para\n> quoted code', author: 'R' });
+  it = read(tmp, 'TASK-2')[0];
+  assert.deepStrictEqual([it.text.split(' — ')[0], it.replies], ['first para\nsecond para\n> quoted code', []]);
   // Drafts stay out of the review file until submitted, then land in order after the note.
   addDraft(tmp, 'TASK-1', { file: 'src/c.ts', line: 7, text: '[change] "x = 1": use a constant', author: 'R' });
   addDraft(tmp, 'TASK-1', { file: 'src/d.ts', text: 'second', author: 'R' });

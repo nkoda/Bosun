@@ -30,7 +30,9 @@ checks), **Stuck** (its session ended, with or without uncommitted work, its lea
 - **Needs you** (the overview) — one card per thing a person has to do, most urgent
   first: agents waiting on you (with their last reply and a box to answer them), stuck
   workers, tickets ready for review or released for review, and files two workers are
-  both changing. Below it: the agents still working, **Fleet over time** (a scrubber
+  both changing. Below it: the agents still working, the **Fleet map** (a live diagram
+  of who holds each worker, their running subagents, who they message and files two
+  workers share), **Fleet over time** (a scrubber
   over the last 200 state changes), changes by repo area (folded), and the tickets
   with their harness steps, flagged with what `fleet gc` would do about them. Worker
   state and those flags come from the engine (`fleet status --json`, `fleet gc --json`),
@@ -38,7 +40,9 @@ checks), **Stuck** (its session ended, with or without uncommitted work, its lea
 - **Lanes** — every open ticket as a card in the column of the first harness step it
   still has to pass (Brief, Gate, Review, Comments, Push, Ready for a person).
 - **Worker pages**, in the order you act on them — the ticket, its state and harness
-  steps; its **review guide**; the conversation with a reply box; the changed files
+  steps; its **review guide**; the conversation with a reply box; its **agents** (a
+  live diagram of the session's subagents and `SendMessage` calls, then each agent with
+  what it is doing now, what it was asked and what it answered); the changed files
   with their review comments inline (click a file for a before / after diff); then,
   folded, the timeline, Mermaid branch graph, change map and churn by file.
 - **Ticket pages** — click any ticket (open or finished) for its review guide and full
@@ -46,6 +50,12 @@ checks), **Stuck** (its session ended, with or without uncommitted work, its lea
 
 The timeline comes from the task's Beads records: every claim, note, handoff, reclaim
 and closure, each tied to the session that made it.
+
+Agents come from what Claude Code writes beside each session's transcript
+(`<session>/subagents/agent-<id>.jsonl` and `.meta.json`). An agent is Done once its last
+reply ends its turn, Running if it wrote in the last two minutes, else Stopped. The server
+re-reads those files every 3 seconds (cached, no git), and a worker whose session finished
+its turn while background agents still run shows as Working.
 
 Live updates repaint only what changed and keep focus, open folds and half-typed
 replies. <kbd>j</kbd> / <kbd>k</kbd> step through the pages; **Fleet: Go to Worker…**
@@ -88,11 +98,16 @@ marked as drafts. **Submit review** moves them all, with an optional overall not
 ## path/to/file.ts:42
 - [ ] comment text — Author · 2026-11-04 10:31
   > what the agent did
+  >> a follow-up from the reviewer — Author · 2026-11-04 11:02
 ```
 
 The agent sees new open comments on its next prompt (through `hook.js`), and in the
 output of `fleet claim` and `fleet note`. It answers by ticking `[x]` and adding a `> `
-line; the page and the gutter threads update from the file.
+line; the page and the gutter threads update from the file. Each gutter thread, and its row in
+the Comments panel, has a colour: none for a draft, 🔴 while the agent owes an answer, 🟡 once
+it answered, 🟢 when you **Mark complete** it. **Reply** under a thread adds a `>> ` follow-up and
+hands the item back to the agent. Completed items are resolved threads, so the Comments
+panel's filter can hide them.
 
 ## Review guides
 

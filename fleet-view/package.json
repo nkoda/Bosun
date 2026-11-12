@@ -16,13 +16,29 @@
       { "command": "fleetView.goTo", "title": "Fleet: Go to Worker…" },
       { "command": "fleetView.openBrowser", "title": "Fleet: Open Dashboard in Browser" },
       { "command": "fleetView.restartServer", "title": "Fleet: Restart Server" },
-      { "command": "fleetView.reply", "title": "Add review comment" }
+      { "command": "fleetView.inspect", "title": "Inspect", "icon": "$(search)" },
+      { "command": "fleetView.review", "title": "Review", "icon": "$(eye)" },
+      { "command": "fleetView.change", "title": "Change", "icon": "$(edit)" },
+      { "command": "fleetView.followUp", "title": "Reply" },
+      { "command": "fleetView.complete", "title": "Mark complete", "icon": "$(pass)" },
+      { "command": "fleetView.reopen", "title": "Reopen", "icon": "$(issue-reopened)" }
     ],
     "menus": {
-      "commandPalette": [{ "command": "fleetView.reply", "when": "false" }],
+      "commandPalette": [{ "command": "fleetView.inspect", "when": "false" }, { "command": "fleetView.review", "when": "false" }, { "command": "fleetView.change", "when": "false" }, { "command": "fleetView.followUp", "when": "false" }, { "command": "fleetView.complete", "when": "false" }, { "command": "fleetView.reopen", "when": "false" }],
       "view/title": [{ "command": "fleetView.open", "when": "view == fleetView.sidebar", "group": "navigation" }],
       "comments/commentThread/context": [
-        { "command": "fleetView.reply", "group": "inline", "when": "commentController == fleetView.review" }
+        { "command": "fleetView.inspect", "group": "inline@1", "when": "commentController == fleetView.review && commentThreadIsEmpty" },
+        { "command": "fleetView.review", "group": "inline@2", "when": "commentController == fleetView.review && commentThreadIsEmpty" },
+        { "command": "fleetView.change", "group": "inline@3", "when": "commentController == fleetView.review && commentThreadIsEmpty" },
+        { "command": "fleetView.followUp", "group": "inline", "when": "commentController == fleetView.review && !commentThreadIsEmpty" }
+      ],
+      "comments/commentThread/title": [
+        { "command": "fleetView.complete", "group": "inline", "when": "commentController == fleetView.review && commentThread =~ /^(open|answered)$/" },
+        { "command": "fleetView.reopen", "group": "inline", "when": "commentController == fleetView.review && commentThread == complete" }
+      ],
+      "commentsView/commentThread/context": [
+        { "command": "fleetView.complete", "group": "inline", "when": "commentController == fleetView.review && commentThread =~ /^(open|answered)$/" },
+        { "command": "fleetView.reopen", "group": "inline", "when": "commentController == fleetView.review && commentThread == complete" }
       ]
     },
     "configuration": {

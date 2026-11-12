@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn, execFile, execFileSync } = require('child_process');
-const { snapshot, aggregate, transitions } = require('./gather');
+const { snapshot, aggregate, transitions, agents, phase } = require('./gather');
 const review = require('./review');
 
 const FLEET = path.resolve(process.argv[2] || '');
@@ -59,11 +59,15 @@ async function refresh() {
     }
     state = { snap, agg: aggregate(snap), trans: hist.trans, changedAt: hist.changedAt, frames: hist.frames || [], reviews, drafts, jobs, port: PORT };
     autoGuides(snap);
-    const msg = `data: ${JSON.stringify(state)}\n\n`;
-    for (const c of clients) c.write(msg);
+    push();
   } catch (e) { console.error(e); }
   busy = false;
   if (again) { again = false; refresh(); }
+}
+
+function push() {
+  const msg = `data: ${JSON.stringify(state)}\n\n`;
+  for (const c of clients) c.write(msg);
 }
 
 let timer;
@@ -71,6 +75,22 @@ const soon = () => { clearTimeout(timer); timer = setTimeout(refresh, 400); };
 for (const d of ['.locks', '.fleet-view/sessions', 'scratchpad/reviews', 'scratchpad/overviews', 'briefs'])
   fs.watch(path.join(FLEET, d), { recursive: true }, soon);
 setInterval(refresh, 30000);
+// Subagent transcripts live under ~/.claude/projects, outside the folders watched above, and change
+// on every tool call: poll just those (cached reads, no git) and push only when something moved.
+setInterval(() => {
+  if (busy || !state.snap) return;
+  let moved = false;
+  for (const w of state.snap.workers) {
+    const si = w.sessionInfo;
+    if (!si?.transcript) continue;
+    const a = agents(si.transcript);
+    if (JSON.stringify(a) === JSON.stringify({ agents: si.agents, sent: si.sent })) continue;
+    w.sessionInfo = { ...si, ...a };
+    w.phase = phase(w);
+    moved = true;
+  }
+  if (moved) push();
+}, 3000);
 
 // Review guides, written headless and read-only by claude -p, one Markdown file per ticket:
 //   gate   <TASK>.md         after every gate pass on new code: why, summary, diagrams, reading order, tests
@@ -136,7 +156,8 @@ function generateGuide(r, kind) {
   jobs[key] = { task: r.task, kind, startedAt: new Date().toISOString() };
   const p = spawn('claude', ['-p', guidePrompt(r, kind), '--output-format', 'text',
     '--allowedTools', 'Read', 'Grep', 'Glob', 'Skill', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git show:*)', 'Bash(git status:*)', 'Bash(git ls-tree:*)', 'Bash(git merge-base:*)',
-    '--disallowedTools', 'Edit', 'Write', 'NotebookEdit'], { cwd: r.codeDir || state.snap.repoDir, env: process.env });
+    // --output makes git diff, log and show write a file, so the git rules above are not read-only alone.
+    '--disallowedTools', 'Edit', 'Write', 'NotebookEdit', 'Bash(git *--output*)'], { cwd: r.codeDir || state.snap.repoDir, env: process.env });
   let out = '', err = '';
   p.stdout.on('data', d => (out += d));
   p.stderr.on('data', d => (err += d));
@@ -217,6 +238,11 @@ const server = http.createServer(async (req, res) => {
     soon(); return json({ ok: true });
   }
   if (url.pathname === '/api/resolve') { review.setDone(FLEET, task, +b.index, !!b.done); soon(); return json({ ok: true }); }
+  if (url.pathname === '/api/followup') {
+    if (!String(b.text || '').trim()) return json({ error: 'empty' }, 400);
+    review.followUp(FLEET, task, +b.index, { text: String(b.text), author: b.author || AUTHOR }); soon(); return json({ ok: true });
+  }
+  if (url.pathname === '/api/complete') { review.setComplete(FLEET, task, +b.index, !!b.complete, b.author || AUTHOR); soon(); return json({ ok: true }); }
   // A review is drafted privately, then submitted into the review file the agent reads.
   if (url.pathname === '/api/draft') {
     if (!String(b.text || '').trim()) return json({ error: 'empty' }, 400);

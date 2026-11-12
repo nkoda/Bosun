@@ -122,7 +122,8 @@ The user may review from the Fleet View panel. Comments land in
 new prompt (through the Fleet View hook) show the ones still open. Treat them as
 requests from the user: make the change or explain why not, then edit that file —
 turn the item's `- [ ]` into `- [x]` and add an indented `> what you did` line under
-it. Leave the `## file:line` headings alone. `release --state review` refuses while
+it. A `>> ` line under an item is the user following up (it unticks the item again):
+answer the newest one with another `> ` line. Leave the `## file:line` headings alone. `release --state review` refuses while
 any open item has no reply. The reviewer (step 3b) writes its findings into the same
 file.
 

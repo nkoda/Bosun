@@ -18,6 +18,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function activate(ctx) {
   const cfg = () => vscode.workspace.getConfiguration('fleetView');
+  const log = vscode.window.createOutputChannel('Fleet View', { log: true });
+  ctx.subscriptions.push(log);
   let author = 'reviewer';
   execFile('git', ['config', 'user.name'], (e, out) => { if (out && out.trim()) author = out.trim(); });
 
@@ -48,7 +50,7 @@ function activate(ctx) {
   function makeFleet(dir) {
     const home = path.join(dir, '.fleet-view');
     fs.mkdirSync(home, { recursive: true });
-    const F = { dir, name: path.basename(dir).replace(/-fleet$/, ''), state: null, panel: null, seen: null, workingSince: {}, threads: [], sig: '' };
+    const F = { dir, name: path.basename(dir).replace(/-fleet$/, ''), state: null, panel: null, seen: null, workingSince: {}, threads: new Map(), sig: '' };
     F.token = () => { try { return fs.readFileSync(path.join(home, 'token'), 'utf8').trim(); } catch { return ''; } };
     F.port = () => { try { return JSON.parse(fs.readFileSync(path.join(home, 'server.json'), 'utf8')).port; } catch { return null; } };
     F.base = () => `http://127.0.0.1:${F.port()}`;
@@ -143,27 +145,48 @@ function activate(ctx) {
   comments.commentingRangeProvider = {
     provideCommentingRanges: doc => doc.uri.scheme === 'file' && workerOf(doc.uri.fsPath).w?.ticket ? [new vscode.Range(0, 0, Math.max(0, doc.lineCount - 1), 0)] : [],
   };
+  // Status colour, shown in the Comments panel and on the thread: none for a draft, red while the
+  // agent owes an answer, yellow once it answered, green when you mark it complete.
+  const DOT = { draft: '', open: '🔴 ', answered: '🟡 ', complete: '🟢 ' };
+  const SAYS = { draft: 'draft, not sent', open: 'waiting on the agent', answered: 'answered, your turn', complete: 'complete' };
+  const itemOf = new Map(); // thread → { F, w, index }, for Reply / Mark complete / Reopen
   function renderThreads(F) {
     const s = F.state;
     const next = JSON.stringify(s.reviews) + JSON.stringify(s.drafts || {}) + s.snap.workers.map(w => w.dir + w.ticket).join();
-    if (next === F.sig) return; // stable across polls, so a half-typed reply survives
+    if (next === F.sig) return;
     F.sig = next;
-    F.threads.forEach(t => t.dispose()); F.threads = [];
+    // Update threads in place and dispose only the ones whose item is gone: disposing a thread
+    // throws away a reply half-typed in it, and the agent rewrites the review file all the time.
+    const old = F.threads, seen = new Map();
+    F.threads = new Map();
     // Drafts show too, so a review in progress is visible where it was written.
-    const items = w => [...(s.reviews[w.ticket] || []), ...(s.drafts?.[w.ticket] || []).map(d => ({ ...d, draft: true, done: false, replies: [] }))];
+    const items = w => [...(s.reviews[w.ticket] || []).map((it, index) => ({ ...it, index })), ...(s.drafts?.[w.ticket] || []).map(d => ({ ...d, draft: true, done: false, replies: [] }))];
     for (const w of s.snap.workers) for (const it of items(w)) {
       if (!it.file || it.file.startsWith('(') || it.file.startsWith('review guide')) continue; // guide-level notes have no line to sit on
-      const line = Math.max(0, (it.line || 1) - 1);
-      const t = comments.createCommentThread(vscode.Uri.file(path.join(w.dir, it.file)), new vscode.Range(line, 0, line, 0), [
-        { body: new vscode.MarkdownString(it.text), mode: vscode.CommentMode.Preview, author: { name: 'review' } },
-        ...it.replies.map(r => ({ body: new vscode.MarkdownString(r), mode: vscode.CommentMode.Preview, author: { name: 'agent' } })),
-      ]);
-      t.label = `${w.ticket} · ${it.draft ? 'draft, not sent' : it.done ? 'addressed' : 'open'}`;
-      t.state = it.done ? vscode.CommentThreadState.Resolved : vscode.CommentThreadState.Unresolved;
-      t.collapsibleState = it.done ? vscode.CommentThreadCollapsibleState.Collapsed : vscode.CommentThreadCollapsibleState.Expanded;
-      t.canReply = false;
-      F.threads.push(t);
+      const line = Math.max(0, (it.line || 1) - 1), st = review.status(it);
+      // The comment text never changes once written (replies go under it), so it identifies the item.
+      let key = [w.dir, it.draft ? 'draft' : 'item', it.file, line, it.text].join('\0');
+      seen.set(key, (seen.get(key) || 0) + 1); key += '\0' + seen.get(key);
+      const body = [
+        { body: new vscode.MarkdownString(it.text), mode: vscode.CommentMode.Preview, author: { name: DOT[st] + 'review' } },
+        ...(it.thread || []).map(r => ({ body: new vscode.MarkdownString(r.text), mode: vscode.CommentMode.Preview, author: { name: r.who } })),
+      ];
+      let t = old.get(key);
+      old.delete(key);
+      if (t) t.comments = body;
+      else t = comments.createCommentThread(vscode.Uri.file(path.join(w.dir, it.file)), new vscode.Range(line, 0, line, 0), body);
+      // Only on a status change, so a thread you folded or opened stays that way.
+      if (t.contextValue !== st) t.collapsibleState = st === 'complete' ? vscode.CommentThreadCollapsibleState.Collapsed : vscode.CommentThreadCollapsibleState.Expanded;
+      t.label = `${DOT[st]}${w.ticket} · ${SAYS[st]}`;
+      t.contextValue = st;
+      // Complete is Resolved, so the Comments panel's filter can hide or show the completed ones.
+      t.state = st === 'draft' ? undefined : st === 'complete' ? vscode.CommentThreadState.Resolved : vscode.CommentThreadState.Unresolved;
+      t.canReply = st !== 'draft';
+      itemOf.delete(t);
+      if (st !== 'draft') itemOf.set(t, { F, w, index: it.index });
+      F.threads.set(key, t);
     }
+    old.forEach(t => { itemOf.delete(t); t.dispose(); });
   }
 
   // --- sessions: the Claude Code panel when the session belongs to this window, else a terminal
@@ -202,13 +225,21 @@ function activate(ctx) {
   function attach(F, webview, extra, onSwitch) {
     webview.options = { enableScripts: true, localResourceRoots: [vscode.Uri.file(path.join(__dirname, 'media'))] };
     webview.html = html(F, webview, extra);
-    const sub = webview.onDidReceiveMessage(m => {
+    // Every click is logged, and a failure shows instead of doing nothing (Output → Fleet View).
+    const sub = webview.onDidReceiveMessage(async m => {
+      log.info('click', JSON.stringify(m).slice(0, 400));
+      try { await onMessage(m); } catch (e) {
+        log.error(`${m.type} failed: ${e?.stack || e}`);
+        vscode.window.showErrorMessage(`Fleet View: ${m.type}${m.file ? ' ' + m.file : ''} failed: ${e?.message || e}`);
+      }
+    });
+    async function onMessage(m) {
       if (m.type === 'resume') resume(F, m.sid, m.cwd, m.prompt, m.alt);
       // Open a file at a line: the worker's copy, or the branch's (read-only) when no worker has it.
       if (m.type === 'open') {
         const uri = m.rev ? vscode.Uri.from({ scheme: 'fleet-git', path: '/' + m.file, query: JSON.stringify({ dir: m.dir, rev: m.rev }) }) : vscode.Uri.file(path.join(m.dir, m.file));
         const line = Math.max(0, (+m.line || 1) - 1);
-        vscode.window.showTextDocument(uri, { preview: true, selection: new vscode.Range(line, 0, line, 0) });
+        await vscode.window.showTextDocument(uri, { preview: true, selection: new vscode.Range(line, 0, line, 0) });
       }
       if (m.type === 'url') vscode.env.openExternal(vscode.Uri.parse(m.url));
       if (m.type === 'dashboard') openPanel(F, m.sel);
@@ -221,10 +252,10 @@ function activate(ctx) {
         const at = rev => vscode.Uri.from({ scheme: 'fleet-git', path: '/' + m.file, query: JSON.stringify({ dir: m.dir, rev }) });
         const right = m.right ? at(m.right) : vscode.Uri.file(path.join(m.dir, m.file));
         const line = Math.max(0, (+m.line || 1) - 1);
-        vscode.commands.executeCommand('vscode.diff', at(m.rev), right, `${path.basename(m.file)} (${m.rev.slice(0, 7)} ↔ ${m.right || path.basename(m.dir)})`,
+        await vscode.commands.executeCommand('vscode.diff', at(m.rev), right, `${path.basename(m.file)} (${m.rev.slice(0, 7)} ↔ ${m.right || path.basename(m.dir)})`,
           { selection: new vscode.Range(line, 0, line, 0) });
       }
-    });
+    }
     return () => sub.dispose();
   }
   function openPanel(F, sel) {
@@ -236,6 +267,7 @@ function activate(ctx) {
     });
   }
   function setup(F, p, sel) {
+    log.info('dashboard tab attached:', F.dir);
     F.panel = p;
     const detach = attach(F, p.webview, sel ? { sel } : {});
     p.onDidDispose(() => { detach(); F.panel = null; });
@@ -248,6 +280,7 @@ function activate(ctx) {
   }
 
   for (const dir of discover()) makeFleet(dir);
+  log.info('activated; fleets:', fleets.map(F => F.dir).join(', ') || '(none)');
   // ponytail: folders added later bring their fleets in; removing a folder leaves its fleet until reload.
   ctx.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => { for (const dir of discover()) if (!byDir(dir)) makeFleet(dir); }));
 
@@ -289,19 +322,36 @@ function activate(ctx) {
         F.panel?.webview.postMessage({ type: 'select', sel: 'overview' });
       }
     }),
-    vscode.commands.registerCommand('fleetView.reply', async reply => {
-      const { F, w } = workerOf(reply.thread.uri.fsPath);
-      if (!w) return;
-      const line = reply.thread.range ? reply.thread.range.start.line + 1 : null;
-      const file = path.relative(w.dir, reply.thread.uri.fsPath).split(path.sep).join('/');
-      reply.thread.dispose(); // the .md is the truth; the server's next push recreates it
-      F.sig = '';
-      // A draft, like every comment written in Fleet View; Submit review hands them to the agent together.
-      const req = http.request(`${F.base()}/api/draft`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-fleet-token': F.token() } });
-      req.on('error', () => review.addDraft(F.dir, w.ticket, { file, line, text: reply.text, author }));
-      req.end(JSON.stringify({ worker: w.name, file, line, text: reply.text, author }));
+    // One gutter button per intent; the tag is what Fleet View and the agent read.
+    ...['inspect', 'review', 'change'].map(intent => vscode.commands.registerCommand(`fleetView.${intent}`, reply => addComment(reply, intent))),
+    vscode.commands.registerCommand('fleetView.followUp', reply => {
+      const at = itemOf.get(reply.thread);
+      if (!at || !reply.text.trim()) return;
+      send(at.F, 'followup', { worker: at.w.name, index: at.index, text: reply.text, author },
+        () => review.followUp(at.F.dir, at.w.ticket, at.index, { text: reply.text, author }));
     }),
+    ...[['complete', true], ['reopen', false]].map(([cmd, complete]) => vscode.commands.registerCommand(`fleetView.${cmd}`, thread => {
+      const at = itemOf.get(thread);
+      if (at) send(at.F, 'complete', { worker: at.w.name, index: at.index, complete, author }, () => review.setComplete(at.F.dir, at.w.ticket, at.index, complete, author));
+    })),
   );
+  // Through the server, so every view updates at once; straight to the file when it is down.
+  function send(F, api, body, fallback) {
+    F.sig = ''; // the server's next push re-syncs the threads (in place, so other half-typed replies survive)
+    const req = http.request(`${F.base()}/api/${api}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-fleet-token': F.token() } });
+    req.on('error', fallback);
+    req.end(JSON.stringify(body));
+  }
+  function addComment(reply, intent) {
+    const { F, w } = workerOf(reply.thread.uri.fsPath);
+    if (!w || !reply.text.trim()) return;
+    const line = reply.thread.range ? reply.thread.range.start.line + 1 : null;
+    const file = path.relative(w.dir, reply.thread.uri.fsPath).split(path.sep).join('/');
+    reply.thread.dispose(); // the .md is the truth; the server's next push recreates it
+    // A draft, like every comment written in Fleet View; Submit review hands them to the agent together.
+    const text = `[${intent}] ${reply.text}`;
+    send(F, 'draft', { worker: w.name, file, line, text, author }, () => review.addDraft(F.dir, w.ticket, { file, line, text, author }));
+  }
 }
 
 module.exports = { activate, deactivate() {} };

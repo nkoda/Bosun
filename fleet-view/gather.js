@@ -120,7 +120,7 @@ async function harness(fleet, conf, r, codeDir, repoDir) {
   const tree = codeDir ? await codeTree(codeDir) : branch ? await git(repoDir, 'rev-parse', '-q', '--verify', `refs/heads/${branch}^{tree}`) : '';
   let brief = false;
   try { brief = /^## Acceptance criteria/m.test(fs.readFileSync(path.join(fleet, 'briefs', `${r.external_ref}.md`), 'utf8')); } catch {}
-  const unanswered = review.read(fleet, r.external_ref).filter(i => !i.done && !i.replies.length).length;
+  const unanswered = review.read(fleet, r.external_ref).filter(i => review.status(i) === 'open').length;
   // As of the last fetch: the dashboard never touches the network.
   const head = branch && await git(repoDir, 'rev-parse', '-q', '--verify', `refs/heads/${branch}`);
   const remote = branch && await git(repoDir, 'rev-parse', '-q', '--verify', `refs/remotes/${conf.remote}/${branch}`);
@@ -206,6 +206,59 @@ function sessions(fleet) {
     .filter(Boolean).sort((a, b) => (b.at || '').localeCompare(a.at || ''));
 }
 
+// A JSONL file's entries (only its last `max` bytes), re-read only when the file changes.
+const jsonlCache = new Map();
+function jsonl(file, max = 1 << 20) {
+  let st;
+  try { st = fs.statSync(file); } catch { return { entries: [] }; }
+  const hit = jsonlCache.get(file);
+  if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit;
+  const fd = fs.openSync(file, 'r'), len = Math.min(st.size, max), buf = Buffer.alloc(len);
+  fs.readSync(fd, buf, 0, len, st.size - len);
+  fs.closeSync(fd);
+  const entries = [];
+  for (const l of buf.toString('utf8').split('\n')) { try { entries.push(JSON.parse(l)); } catch {} } // a cut first line is dropped
+  const out = { mtimeMs: st.mtimeMs, size: st.size, entries };
+  jsonlCache.set(file, out);
+  return out;
+}
+const textOf = m => typeof m?.content === 'string' ? m.content : (m?.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');
+const toolUses = e => e.type === 'assistant' && Array.isArray(e.message?.content) ? e.message.content.filter(c => c.type === 'tool_use') : [];
+const what = t => `${t.name} ${t.input?.file_path || t.input?.command || t.input?.pattern || t.input?.description || t.input?.url || ''}`.trim().split('\n')[0].slice(0, 140);
+// SendMessage calls in a transcript: who this session or agent talked to.
+const sentIn = (entries, from) => entries.flatMap(e => toolUses(e).filter(t => t.name === 'SendMessage')
+  .map(t => ({ from, to: String(t.input?.to || '?'), summary: String(t.input?.summary || t.input?.message || '').split('\n')[0].slice(0, 140), at: e.timestamp })));
+
+// A session's subagents and messages, from what Claude Code writes beside its transcript:
+// <session>/subagents/agent-<id>.jsonl, and agent-<id>.meta.json (type, description, foreground or background).
+// ponytail: "running" = no final reply and written in the last 2 minutes; SubagentStart/Stop hooks if that guesses wrong.
+// ponytail: flat list; nested agents (spawnDepth > 1) would need their parent found by toolUseId.
+function agents(transcript) {
+  if (!transcript) return { agents: [], sent: [] };
+  const dir = path.join(transcript.replace(/\.jsonl$/, ''), 'subagents');
+  let names = [];
+  try { names = fs.readdirSync(dir).filter(n => n.endsWith('.meta.json')); } catch {}
+  const list = names.map(n => {
+    const id = n.slice('agent-'.length, -'.meta.json'.length), file = path.join(dir, `agent-${id}.jsonl`);
+    let meta = {};
+    try { meta = JSON.parse(fs.readFileSync(path.join(dir, n), 'utf8')); } catch {}
+    const { mtimeMs = 0, entries } = jsonl(file, 8 << 20);
+    const last = entries.findLast(e => e.type === 'assistant'), step = entries.flatMap(toolUses).pop();
+    const finished = last?.message?.stop_reason === 'end_turn' && !toolUses(last).length;
+    return {
+      id, type: meta.agentType || 'agent', description: meta.description || '', background: meta.requestShape === 'background',
+      status: finished ? 'done' : Date.now() - mtimeMs < 120000 ? 'running' : 'stopped',
+      startedAt: entries[0]?.timestamp, at: mtimeMs ? new Date(mtimeMs).toISOString() : null,
+      prompt: textOf(entries.find(e => e.type === 'user')?.message).slice(0, 2000),
+      reply: finished ? textOf(last.message).slice(-1500) : '', doing: finished || !step ? '' : what(step),
+      sent: sentIn(entries, id),
+    };
+  }).sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, 30);
+  const sent = [...sentIn(jsonl(transcript).entries, 'session'), ...list.flatMap(a => a.sent)].sort((a, b) => String(a.at).localeCompare(String(b.at))).slice(-20);
+  for (const a of list) delete a.sent;
+  return { agents: list, sent };
+}
+
 // Per-ticket review guides written by server.js: <TASK>.md after a gate pass (or on demand),
 // <TASK>.review.md in depth once the ticket reaches review. The header comment says which code.
 function guides(fleet, task) {
@@ -248,6 +301,7 @@ async function snapshot(fleet, extraBases = []) {
       record: rec || null, ticket: w.task || rec?.task || null, jira: jiraUrl(w.task || rec?.task),
       sessionInfo: sess.find(x => x.session_id === sid) || (sid ? { session_id: sid } : null),
     });
+    if (w.sessionInfo?.transcript) w.sessionInfo = { ...w.sessionInfo, ...agents(w.sessionInfo.transcript) };
     w.phase = phase(w);
   }
   return { fleet, repoDir, name: conf.name, bases, jira: conf.jira, harness: conf.harness, at: new Date().toISOString(), workers, records: recs, closed, sessions: sess.slice(0, 12), gc: gc?.rows || [] };
@@ -263,6 +317,9 @@ function phase(w) {
   if (STUCK[w.state]) return { key: 'stuck', why: STUCK[w.state] };
   if (w.state !== 'CLAIMED') return { key: 'idle' };
   if (w.sessionInfo?.busy) return { key: 'working' };
+  // The agent ended its turn but its background agents are still at it.
+  const running = (w.sessionInfo?.agents || []).filter(a => a.status === 'running').length;
+  if (running) return { key: 'working', why: `${running} agent${running === 1 ? '' : 's'} still running` };
   const h = w.record?.harness;
   if (h && !h.blocker) return { key: 'review', why: 'Passes everything release checks' };
   return { key: 'needs', why: !w.sessionInfo?.lastReply ? 'No activity from its session yet' : h?.blocker || 'The agent finished its turn' };
@@ -310,7 +367,7 @@ function transitions(prev, next) {
   return out;
 }
 
-module.exports = { findFleetDir, snapshot, aggregate, transitions, harnessSteps, phase };
+module.exports = { findFleetDir, snapshot, aggregate, transitions, harnessSteps, phase, agents };
 
 // Self-check: `node gather.js [fleet-dir]`
 if (require.main === module) {
@@ -335,6 +392,21 @@ if (require.main === module) {
     assert.strictEqual(phase({ state: 'CLAIMED', sessionInfo: { lastReply: 'x' }, record: ready }).key, 'review');
     assert.deepStrictEqual(phase({ state: 'CLAIMED', sessionInfo: { lastReply: 'x' }, record: blocked }), { key: 'needs', why: 'Gate not run' });
     assert.strictEqual(phase({ state: 'CLAIMED' }).why, 'No activity from its session yet');
+    assert.strictEqual(phase({ state: 'CLAIMED', sessionInfo: { lastReply: 'x', agents: [{ status: 'running' }] }, record: blocked }).key, 'working');
+    // Subagents: a finished one, a running one, a SendMessage from the session.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-agents-')), sub = path.join(tmp, 's', 'subagents');
+    fs.mkdirSync(sub, { recursive: true });
+    const L = (...es) => es.map(e => JSON.stringify(e)).join('\n') + '\n';
+    fs.writeFileSync(path.join(tmp, 's.jsonl'), L({ type: 'assistant', timestamp: '2026-01-01T00:00:00Z', message: { content: [{ type: 'tool_use', name: 'SendMessage', input: { to: 'peer', summary: 'hi' } }] } }));
+    fs.writeFileSync(path.join(sub, 'agent-a1.meta.json'), JSON.stringify({ agentType: 'Explore', description: 'find x', requestShape: 'background' }));
+    fs.writeFileSync(path.join(sub, 'agent-a1.jsonl'), L({ type: 'user', timestamp: '2026-01-01T00:00:01Z', message: { content: 'look for x' } }, { type: 'assistant', message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'found x' }] } }));
+    fs.writeFileSync(path.join(sub, 'agent-a2.meta.json'), JSON.stringify({ agentType: 'general-purpose', description: 'fix y' }));
+    fs.writeFileSync(path.join(sub, 'agent-a2.jsonl'), L({ type: 'user', timestamp: '2026-01-01T00:00:02Z', message: { content: 'fix y' } }, { type: 'assistant', message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', name: 'Read', input: { file_path: 'y.js' } }] } }));
+    const ag = agents(path.join(tmp, 's.jsonl'));
+    fs.rmSync(tmp, { recursive: true });
+    assert.deepStrictEqual(ag.agents.map(a => [a.id, a.status, a.doing, a.reply]), [['a2', 'running', 'Read y.js', ''], ['a1', 'done', '', 'found x']]);
+    assert.strictEqual(ag.agents[1].prompt, 'look for x');
+    assert.deepStrictEqual(ag.sent.map(m => [m.from, m.to, m.summary]), [['session', 'peer', 'hi']]);
     console.log(JSON.stringify({
       workers: s.workers.map(w => [w.name, w.state, w.task, w.branch, w.base, `files=${(w.files || []).length}`]),
       records: s.records.map(r => [r.task, r.state, r.flags.join('; ')]),

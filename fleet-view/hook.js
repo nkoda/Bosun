@@ -72,11 +72,11 @@ function main(input) {
 
     if (ev.hook_event_name === 'UserPromptSubmit' && held?.task) {
       const open = review.read(fleet, held.task).filter(i => !i.done);
-      const sig = JSON.stringify(open.map(i => [i.file, i.line, i.text]));
+      const sig = JSON.stringify(open.map(i => [i.file, i.line, i.text, i.thread.length]));
       if (open.length && sig !== s.reviewSig) {
         out += `\n[Fleet review] ${open.length} open review comment(s) on ${held.task} from the user, in ${review.reviewFile(fleet, held.task)}:\n` +
-          open.map(i => `- ${i.file}${i.line ? ':' + i.line : ''}: ${i.text.replace(/\n/g, ' ')}`).join('\n') +
-          `\nAddress them (or say why not): a comment tagged [inspect] wants an explanation and no code change, [review] wants you to check for problems and report, [change] wants the change made. Then in that file change "- [ ]" to "- [x]" and add an indented "> what you did" line under each.\n`;
+          open.map(i => `- ${i.file}${i.line ? ':' + i.line : ''}: ${i.text.replace(/\n/g, ' ')}${i.thread.at(-1)?.who === 'you' ? ` (follow-up: ${i.thread.at(-1).text})` : ''}`).join('\n') +
+          `\nAddress them (or say why not): a comment tagged [inspect] wants an explanation and no code change, [review] wants you to check for problems and report, [change] wants the change made. Then in that file change "- [ ]" to "- [x]" and add an indented "> what you did" line under each (for a follow-up, under its ">> " line).\n`;
       }
       s.reviewSig = sig;
     }

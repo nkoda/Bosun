@@ -80,7 +80,7 @@ export BD_NON_INTERACTIVE=1 BD_DISABLE_METRICS=1 BD_NO_INSTALL_HOOKS=1 BD_NO_PAG
 
 SESSION="${CLAUDE_CODE_SESSION_ID:-manual-$USER}"
 OWNER_PID="${CLAUDE_PID:-$PPID}"
-SESSIONS_DIR="${CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}"   # <pid>.json per running Claude Code process
+SESSIONS_GLOB="${CLAUDE_SESSIONS_DIR:-$HOME/.claude*/sessions}/*.json"   # <pid>.json per running Claude Code process, every account's config dir
 export BD_ACTOR="$SESSION"
 
 now()  { date +%s; }
@@ -119,7 +119,7 @@ EOF
 # ponytail: a reused pid reads as alive, as before; compare process start times if that bites.
 owner_alive() { # <session> <pid>
   local p
-  for p in $(jq -r --arg s "$1" 'select(.sessionId == $s) | .pid' "$SESSIONS_DIR"/*.json 2>/dev/null); do
+  for p in $(jq -r --arg s "$1" 'select(.sessionId == $s) | .pid' $SESSIONS_GLOB 2>/dev/null); do
     kill -0 "$p" 2>/dev/null && return 0
   done
   [ -z "$2" ] || kill -0 "$2" 2>/dev/null
@@ -180,13 +180,13 @@ review_open() { # <TASK>
   [ "${n:-0}" -gt 0 ] || return 0
   echo
   echo "=== $n open review comment(s) — $f"
-  echo "=== address each, then edit the file: '- [ ]' -> '- [x]' plus an indented '> what you did' line"
+  echo "=== address each, then edit the file: '- [ ]' -> '- [x]' plus an indented '> what you did' line (a '>> ' line is the user following up: answer the newest)"
   awk '/^## /{h=$0; next} /^- \[ \]/{print h; print; p=1; next} p && /^[[:space:]]/{print; next} {p=0}' "$f"
 }
 
-# Review items nobody has answered: "- [ ]" with no indented "> reply" under it.
+# Review items nobody has answered: "- [ ]" with no indented "> reply" under it, or a ">> " follow-up after the last one.
 review_unanswered() { # <TASK>
-  awk '/^- \[ \]/{n+=o; o=1; next} /^- \[[xX]\]/{n+=o; o=0; next} /^[[:space:]]+>/{o=0; next}
+  awk '/^- \[ \]/{n+=o; o=1; u=1; next} /^- \[[xX]\]/{n+=o; o=0; u=0; next} /^[[:space:]]+>>/{o=u; next} /^[[:space:]]+>/{o=0; next}
        /^## / || /^[[:space:]]*$/{n+=o; o=0} END{print n+o}' "$REVIEWS/$1.md" 2>/dev/null || echo 0
 }
 
