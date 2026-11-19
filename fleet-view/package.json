@@ -2,7 +2,7 @@
   "name": "fleet-view",
   "displayName": "Fleet View",
   "description": "Live view of ~/.claude/fleet fleets: workers, sessions, changes, diagrams and review comments.",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "publisher": "local",
   "engines": { "vscode": "^1.90.0" },
   "main": "./extension.js",
