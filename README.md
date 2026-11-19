@@ -35,7 +35,6 @@ Status: early, and built on Claude Code internals that may change between releas
 
 ## What you need
 
-- Access to this private repository on GitHub, with an SSH key.
 - macOS or Linux, with git, jq, node and [Beads](https://github.com/steveyegge/beads).
   On macOS: `brew install git jq node beads`.
 - [Claude Code](https://docs.claude.com/en/docs/claude-code).
@@ -364,19 +363,6 @@ checkout, so keep it on a branch that has these files.
 
 Self-checks: `engine/test_fleet.sh`, `node fleet-view/review.js` and `node fleet-view/gather.js <fleet-dir>`.
 
-## Private use
-
-Use this repository only for private or controlled work. It is a structured workflow for safe parallel execution and is not intended for public redistribution.
-
 ## License
 
-Copyright (c) 2026 nkoda. All rights reserved.
-
-People given access to this repository by the copyright holder may use and
-modify the software for their own work. They may not publish, redistribute,
-sublicense or sell it, in source or compiled form, without written permission.
-This permission ends when their access is removed.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
-
-The same terms are in `LICENSE`. `NOTICE` covers distribution.
+MIT. See `LICENSE`.
