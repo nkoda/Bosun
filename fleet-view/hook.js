@@ -3,11 +3,14 @@
 // <fleet>/.fleet-view/sessions/<id>.json — the dashboard watches that folder, so it refreshes
 // every time you prompt and every time the agent finishes. On UserPromptSubmit it also hands
 // the agent any review comments that are new since it last saw them (stdout becomes context).
+// When the session holds a worker, each event also appends the worker's exact code tree to
+// <fleet>/.fleet-view/turns/<task>.jsonl, so the change graph can tell which turn wrote a line.
 // Never blocks the session: every failure is swallowed and the exit code is always 0.
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const review = require('./review');
+const { codeTree } = require('./gather');
 
 const KNOWN = path.join(os.homedir(), '.claude', 'fleet', 'fleets.json'); // written by server.js on start
 
@@ -54,11 +57,12 @@ function lastReply(transcript) {
   return '';
 }
 
-function main(input) {
+async function main(input) {
   const ev = JSON.parse(input);
   const sid = ev.session_id, cwd = ev.cwd || process.cwd();
   if (!sid) return;
   let out = '';
+  const snaps = []; // { fleet, held, at } for each fleet where the session holds a worker
   for (const fleet of fleetsFor(cwd, sid)) {
     const dir = path.join(fleet, '.fleet-view', 'sessions');
     fs.mkdirSync(dir, { recursive: true });
@@ -82,10 +86,24 @@ function main(input) {
     }
     fs.writeFileSync(file + '.tmp', JSON.stringify(s, null, 1));
     fs.renameSync(file + '.tmp', file);
+    if (held?.task) snaps.push({ fleet, held, at: s.at });
   }
   if (out) process.stdout.write(out);
+
+  // Only now, with every session file written and the comments handed over: if the hook
+  // timeout kills a snapshot, only its turn line is lost.
+  const kind = { UserPromptSubmit: 'prompt', Stop: 'stop' }[ev.hook_event_name];
+  for (const { fleet, held, at } of kind ? snaps : []) try {
+    const tree = await codeTree(path.join(fleet, held.worker));
+    if (!tree) continue;
+    const turn = { at, event: kind, session: sid, worker: held.worker, task: held.task, tree };
+    if (kind === 'prompt') turn.prompt = String(ev.prompt || '').slice(0, 300);
+    const turns = path.join(fleet, '.fleet-view', 'turns');
+    fs.mkdirSync(turns, { recursive: true });
+    fs.appendFileSync(path.join(turns, `${held.task}.jsonl`), JSON.stringify(turn) + '\n');
+  } catch {}
 }
 
 let input = '';
 process.stdin.on('data', d => (input += d));
-process.stdin.on('end', () => { try { main(input); } catch {} process.exit(0); });
+process.stdin.on('end', async () => { try { await main(input); } catch {} process.exit(0); });
