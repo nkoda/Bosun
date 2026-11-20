@@ -206,9 +206,12 @@ brief_hint() { # <TASK>
 # The worker's code as one tree id: HEAD plus every staged, unstaged and untracked
 # change. Same id means same code, so a gate result is tied to exactly what it ran on.
 tree_id() { # <dir>
-  local idx="$GATE_DIR/index-$$" t
+  local idx="$GATE_DIR/index-$$" t f p
   mkdir -p "$GATE_DIR"
-  cp "$(git -C "$1" rev-parse --path-format=absolute --git-path index)" "$idx" 2>/dev/null || rm -f "$idx"
+  # A killed gate leaves its index behind: drop every one whose process is gone.
+  for f in "$GATE_DIR"/index-*; do p="${f##*/index-}"; p="${p%%.*}"; kill -0 "$p" 2>/dev/null || rm -f "$f"; done
+  # -p keeps the index's mtime: a fresh one hides a same-size edit made in the second the index was written (racy git).
+  cp -p "$(git -C "$1" rev-parse --path-format=absolute --git-path index)" "$idx" 2>/dev/null || rm -f "$idx"
   t="$(GIT_INDEX_FILE="$idx" git -C "$1" add -A 2>/dev/null && GIT_INDEX_FILE="$idx" git -C "$1" write-tree)"
   rm -f "$idx"
   [ -n "$t" ] && echo "$t"
@@ -899,7 +902,8 @@ cmd_gc() {
       close)
         bdq note "$id" "[$(iso "$(now)")] [fleet] gc: $reason" >/dev/null
         bdq update "$id" --set-metadata "state=done" >/dev/null
-        bdq close "$id" --reason "gc: $reason (by $SESSION)" >/dev/null && echo "closed $key — $reason" ;;
+        bdq close "$id" --reason "gc: $reason (by $SESSION)" >/dev/null && echo "closed $key — $reason"
+        rm -f "$FLEET/.fleet-view/turns/$key.jsonl" "$FLEET/.fleet-view/graphs/$key.json" ;;
       pause)
         # a reclaim above may have paused it already
         [ "$(bead_field "$id" .metadata.state)" = claimed ] || continue

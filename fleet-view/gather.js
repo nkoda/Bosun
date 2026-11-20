@@ -80,8 +80,19 @@ async function workerChanges(dir, bases) {
 // Same as tree_id() in ../engine/fleet: HEAD plus every uncommitted and untracked change
 // as one tree id, so a gate or review result can be matched to the code in the worker.
 async function codeTree(dir) {
-  const idx = path.join(os.tmpdir(), `fleet-view-index-${process.pid}-${path.basename(dir)}`);
-  try { fs.copyFileSync(await git(dir, 'rev-parse', '--path-format=absolute', '--git-path', 'index'), idx); } catch { return ''; }
+  const tmp = os.tmpdir(), pre = 'fleet-view-index-';
+  // A killed hook leaves its index behind: drop every one whose process is gone.
+  for (const f of fs.readdirSync(tmp)) {
+    if (!f.startsWith(pre)) continue;
+    try { process.kill(+f.slice(pre.length).split('-')[0], 0); } catch (e) { if (e.code === 'ESRCH') fs.rmSync(path.join(tmp, f), { force: true }); }
+  }
+  const idx = path.join(tmp, `${pre}${process.pid}-${path.basename(dir)}`);
+  try {
+    const src = await git(dir, 'rev-parse', '--path-format=absolute', '--git-path', 'index');
+    fs.copyFileSync(src, idx);
+    // Keep the index's mtime: a fresh one hides a same-size edit made in the second the index was written (racy git).
+    const st = fs.statSync(src); fs.utimesSync(idx, st.atime, st.mtime);
+  } catch { fs.rmSync(idx, { force: true }); return ''; }
   await run('git', ['-C', dir, 'add', '-A'], { GIT_INDEX_FILE: idx });
   const t = await run('git', ['-C', dir, 'write-tree'], { GIT_INDEX_FILE: idx });
   fs.rmSync(idx, { force: true });
@@ -367,7 +378,7 @@ function transitions(prev, next) {
   return out;
 }
 
-module.exports = { findFleetDir, snapshot, aggregate, transitions, harnessSteps, phase, agents };
+module.exports = { findFleetDir, snapshot, aggregate, transitions, harnessSteps, phase, agents, codeTree };
 
 // Self-check: `node gather.js [fleet-dir]`
 if (require.main === module) {

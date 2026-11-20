@@ -166,9 +166,25 @@ grep -Eq "close +T-3 .*merged into origin/main" "$T/out" && grep -Eq "needs-you 
   && grep -Eq "needs-you +T-5 .*is gone" "$T/out" && grep -Eq "free +worker-2" "$T/out" && ! grep -Eq " T-2 | T-1 " "$T/out" \
   && ok "gc closes merged records, frees dead clean workers, asks about the rest, skips live and unmerged work" || { bad "gc report"; cat "$T/out"; }
 fleet gc --json | jq -e '.rows | length > 0' >/dev/null && ok "gc --json is machine-readable" || bad "gc json"
+mkdir -p "$T/fleet/.fleet-view/turns" "$T/fleet/.fleet-view/graphs"
+for k in 3 4; do touch "$T/fleet/.fleet-view/turns/T-$k.jsonl" "$T/fleet/.fleet-view/graphs/T-$k.json"; done
 fleet gc --apply > "$T/out" 2>&1
+[ ! -e "$T/fleet/.fleet-view/turns/T-3.jsonl" ] && [ ! -e "$T/fleet/.fleet-view/graphs/T-3.json" ] \
+  && [ -e "$T/fleet/.fleet-view/turns/T-4.jsonl" ] && [ -e "$T/fleet/.fleet-view/graphs/T-4.json" ] \
+  && ok "gc --apply drops a closed task's turns and graph, and keeps the open ones" || bad "gc turns/graphs"
 ! fleet show T-3 >/dev/null 2>&1 && fleet show T-4 >/dev/null && fleet status | grep -Eq "^worker-2 +FREE" \
   && fleet status | grep -Eq "^worker-1 +CLAIMED +T-2" && [ -f "$W/src/wip" ] \
   && ok "gc --apply closes T-3 and frees worker-2, and leaves the live worker and open questions alone" || { bad "gc apply"; cat "$T/out"; fleet status; }
+
+# --- tree_id: a same-size edit in the second the index was written still changes the id (racy git),
+# and an index left by a killed run is swept
+R="$T/racy"; git init -q "$R"; echo aaaa > "$R/a"; q "$R" add -A; q "$R" commit -m r
+eval "$(sed -n '/^tree_id()/,/^}/p' "$ENGINE")"; GATE_DIR="$T/gate"; mkdir -p "$GATE_DIR"; touch "$GATE_DIR/index-999999"
+miss=0; for i in 1 2 3 4 5 6 7 8 9 10; do
+  echo bbbb > "$R/a"; git -C "$R" add a; w="$(git -C "$R" write-tree)"; echo BBBB > "$R/a"
+  [ "$(tree_id "$R")" = "$w" ] && miss=$((miss + 1))
+done
+[ "$miss" = 0 ] && [ ! -e "$GATE_DIR/index-999999" ] \
+  && ok "tree_id sees racy same-size edits and sweeps a dead run's index" || bad "tree_id racy ($miss missed)"
 
 [ "$FAILS" = 0 ] && echo "all passed" || { echo "$FAILS failed"; exit 1; }
