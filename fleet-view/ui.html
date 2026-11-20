@@ -234,6 +234,7 @@ dialog textarea { background: var(--input); color: var(--fg); border: 1px solid 
 .fst { font-size: 11px; border-radius: 3px; padding: 0 6px; line-height: 17px; font-weight: 600; }
 .fst-new { background: color-mix(in srgb, var(--add) 22%, transparent); color: var(--add); }
 .fst-modified { background: color-mix(in srgb, var(--mod) 22%, transparent); color: var(--mod); }
+.fst-context { border: 1px dashed var(--fg-2); color: var(--fg-2); }
 .fst-deleted { background: color-mix(in srgb, var(--del) 22%, transparent); color: var(--del); }
 .kl { display: grid; grid-template-columns: 104px 1fr; gap: 8px; padding: 3px 0; }
 .kl .k { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; color: var(--fg-2); padding-top: 2px; }
@@ -281,7 +282,23 @@ q.aq { color: var(--fg-2); font-style: italic; }
 .dt td { border: 0; padding: 0 6px; white-space: pre; vertical-align: top; }
 .dt .ln { width: 1%; color: var(--fg-2); text-align: right; user-select: none; opacity: .7; }
 .dt .pl { width: 18px; padding: 0; }
-.dt tr.a { background: color-mix(in srgb, var(--add) 14%, transparent); } .dt tr.d { background: color-mix(in srgb, var(--del) 14%, transparent); }
+.dt tr.a { background: color-mix(in srgb, var(--add) 22%, transparent); } .dt tr.d { background: color-mix(in srgb, var(--del) 22%, transparent); }
+.dt tr.a .code::before, .dt tr.d .code::before, .dt tr.c .code::before { display: inline-block; width: 1.2em; content: ' '; }
+.dt tr.a .code::before { content: '+'; color: var(--add); } .dt tr.d .code::before { content: '−'; color: var(--del); }
+.pop:has(> .peek) { width: min(820px, calc(100vw - 16px)); padding: 0; gap: 0; overflow: hidden; }
+.pop > .peek { border: 0; } .pop .dt-wrap { max-height: min(420px, 45vh); }
+/* Syntax colours in diffs (highlight.js classes), VS Code's Dark+ and Light+ palettes. */
+.dt { --hl-kw: #569cd6; --hl-str: #ce9178; --hl-com: #6a9955; --hl-num: #b5cea8; --hl-fn: #dcdcaa; --hl-type: #4ec9b0; --hl-var: #9cdcfe; --hl-meta: #c586c0; }
+:root[data-theme="light"] .dt, body.vscode-light .dt { --hl-kw: #0000ff; --hl-str: #a31515; --hl-com: #008000; --hl-num: #098658; --hl-fn: #795e26; --hl-type: #267f99; --hl-var: #001080; --hl-meta: #af00db; }
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) body:not(.vscode-dark):not(.vscode-high-contrast) .dt { --hl-kw: #0000ff; --hl-str: #a31515; --hl-com: #008000; --hl-num: #098658; --hl-fn: #795e26; --hl-type: #267f99; --hl-var: #001080; --hl-meta: #af00db; } }
+.dt :is(.hljs-keyword, .hljs-literal, .hljs-selector-tag, .hljs-tag, .hljs-name) { color: var(--hl-kw); }
+.dt :is(.hljs-string, .hljs-regexp, .hljs-char) { color: var(--hl-str); }
+.dt :is(.hljs-comment, .hljs-quote) { color: var(--hl-com); font-style: italic; }
+.dt :is(.hljs-number, .hljs-bullet) { color: var(--hl-num); }
+.dt :is(.hljs-title, .hljs-section) { color: var(--hl-fn); }
+.dt :is(.hljs-type, .hljs-built_in, .hljs-title.class_, .hljs-class .hljs-title) { color: var(--hl-type); }
+.dt :is(.hljs-attr, .hljs-attribute, .hljs-variable, .hljs-params, .hljs-property, .hljs-template-variable) { color: var(--hl-var); }
+.dt :is(.hljs-meta, .hljs-symbol, .hljs-subst, .hljs-selector-class, .hljs-selector-id) { color: var(--hl-meta); }
 .dt tr.hk td { color: var(--link); background: var(--bg-2); padding: 3px 8px; font-style: italic; }
 .dt tr.focus td { box-shadow: inset 3px 0 0 var(--focus); }
 .dt tr.noted .ln:nth-child(2) { color: var(--s2); font-weight: 700; opacity: 1; }
@@ -333,6 +350,17 @@ tr.click { cursor: pointer; } tr.click:hover td { background: var(--hover); }
 details.fold > summary { cursor: pointer; padding: 8px 12px; color: var(--fg-2); font-size: 12px; list-style: none; }
 details.fold > summary::-webkit-details-marker { display: none; }
 details.fold[open] > summary .codicon-chevron-right { transform: rotate(90deg); }
+/* change graph: classes toggled on the drawn SVG, so selecting never moves the layout */
+.cg .mmd { overflow: hidden; border: 1px solid var(--border); border-radius: 6px; }
+.cg .mmd svg { cursor: grab; user-select: none; touch-action: none; } .cg .mmd svg.panning { cursor: grabbing; }
+.cg .mmd svg g.node[data-cg] { cursor: pointer; }
+.cg .mmd svg g.node[data-cg]:focus { outline: none; }
+.cg .mmd svg g.node[data-cg]:is(:hover, :focus-visible) > :is(rect, path, polygon) { stroke: var(--focus) !important; }
+.cg .mmd svg g.node.cg-sel > :is(rect, path, polygon) { stroke-width: 4px !important; filter: drop-shadow(0 0 4px var(--focus)); }
+.cg .mmd svg g.node.cg-near > :is(rect, path, polygon) { stroke-width: 3px !important; }
+.cg .mmd svg .cg-dim { opacity: .22; }
+.cg .mmd svg path.cg-hot { stroke: var(--focus) !important; stroke-width: 2px !important; }
+.cg-turn { flex: 3; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .conn { position: fixed; bottom: 8px; right: 12px; font-size: 12px; color: var(--fg-2); background: var(--bg-3); border: 1px solid var(--border); padding: 2px 8px; border-radius: 4px; display: none; }
 </style>
 </head>
@@ -357,6 +385,7 @@ details.fold[open] > summary .codicon-chevron-right { transform: rotate(90deg); 
   </form>
 </dialog>
 <script nonce="__NONCE__" src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script nonce="__NONCE__" src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.11.1/highlight.min.js"></script>
 <script nonce="__NONCE__" src="https://cdn.jsdelivr.net/npm/marked@14/marked.min.js"></script>
 <script nonce="__NONCE__" src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
 <script nonce="__NONCE__">
@@ -665,12 +694,17 @@ function submitReview(task, anchor) {
 }
 
 // ---------- inline diff preview: peek at a file's hunks without leaving the page, + on a line to comment.
+// Syntax colours line by line, by the file's extension. ponytail: a line at a time, so a block
+// comment or string that spans lines is coloured as code after its first line.
+const hlLang = f => { const e = (f.match(/\.([^./]+)$/)?.[1] || '').toLowerCase(), x = e === 'jsonl' ? 'json' : e; return x && window.hljs?.getLanguage(x) ? x : null; };
+const hl = (lang, s) => lang ? hljs.highlight(s, { language: lang, ignoreIllegals: true }).value : esc(s);
 const peeks = {}, openPeeks = new Set(); // peeks: "task|file" → diff text; openPeeks: "task|file|line", one per card
 function diffView(task, file, focus) {
   const diff = peeks[task + '|' + file];
   const head = `<div class="peek-h"><span class="mono small">${esc(file)}</span><span class="muted small">preview · press + on a line to comment</span></div>`;
   if (diff == null) return `<div class="peek" data-t="${esc(task)}" data-file="${esc(file)}">${head}<div class="muted small pad">Loading the diff…</div></div>`;
   if (!diff) return `<div class="peek" data-t="${esc(task)}" data-file="${esc(file)}">${head}<div class="muted small pad">No changes in this file.</div></div>`;
+  const lang = hlLang(file);
   const noted = new Set([...(ST.reviews[task] || []), ...(ST.drafts?.[task] || [])].filter(c => c.file === file && c.line).map(c => c.line));
   let o = 0, n = 0;
   const rows = [];
@@ -681,7 +715,7 @@ function diffView(task, file, focus) {
     const t = l[0], [cls, on, nn] = t === '+' ? ['a', '', n++] : t === '-' ? ['d', o++, ''] : ['c', o++, n++], line = nn || on;
     const here = focus && nn && nn >= focus && !rows.some(r => r.includes(' focus'));
     rows.push(`<tr class="dl ${cls}${noted.has(line) && nn ? ' noted' : ''}${here ? ' focus' : ''}" data-line="${line}"><td class="ln">${on}</td><td class="ln">${nn}</td>
-      <td class="pl"><button class="addc" data-act="line-note" data-t="${esc(task)}" data-file="${esc(file)}" data-line="${line}" aria-label="Comment on line ${line}" title="Comment on this line">+</button></td><td class="code">${esc(l.slice(1)) || ' '}</td></tr>`);
+      <td class="pl"><button class="addc" data-act="line-note" data-t="${esc(task)}" data-file="${esc(file)}" data-line="${line}" aria-label="Comment on line ${line}" title="Comment on this line">+</button></td><td class="code">${hl(lang, l.slice(1)) || ' '}</td></tr>`);
     if (rows.length > 800) { rows.push('<tr class="hk"><td colspan="4">Preview stops here. Open the full diff for the rest.</td></tr>'); break; }
   }
   return `<div class="peek" data-t="${esc(task)}" data-file="${esc(file)}">${head}<div class="dt-wrap"><table class="dt">${rows.join('')}</table></div></div>`;
@@ -706,9 +740,24 @@ async function togglePeek(task, file, line = '') {
   openPeeks.has(key) ? openPeeks.delete(key) : openPeeks.add(key);
   applyPeeks(document.getElementById('content'));
   if (!openPeeks.has(key) || cache in peeks) return;
-  const r = await fetch(CFG.server + '/api/diff', { method: 'POST', headers: { 'content-type': 'application/json', 'x-fleet-token': CFG.token }, body: JSON.stringify({ ticket: task, file }) });
-  peeks[cache] = r.ok ? (await r.json()).diff : '';
+  await loadPeek(task, file);
   applyPeeks(document.getElementById('content'));
+}
+async function loadPeek(task, file) {
+  const r = await fetch(CFG.server + '/api/diff', { method: 'POST', headers: { 'content-type': 'application/json', 'x-fleet-token': CFG.token }, body: JSON.stringify({ ticket: task, file }) });
+  peeks[task + '|' + file] = r.ok ? (await r.json()).diff : '';
+}
+// The change graph's preview opens where it was asked for: in the popover, on the node.
+async function cgPeek(task, file, line, anchor) {
+  const draw = () => {
+    popover(anchor, diffView(task, file, +line || 0));
+    const box = pop().querySelector('.dt-wrap'), row = box?.querySelector('tr.focus');
+    if (row) box.scrollTop = row.offsetTop - box.clientHeight / 3;
+  };
+  draw();
+  if (task + '|' + file in peeks) return;
+  await loadPeek(task, file);
+  if (popAnchor === anchor) { draw(); placePop(); }
 }
 function guideSection(r) {
   if (!r) return '';
@@ -731,6 +780,206 @@ function guideSection(r) {
       <div class="md guide" ${ctx} data-t="${esc(r.task)}" data-rev="${esc(r.mergeBase || '')}" data-md="${encodeURIComponent(cur.text)}"></div></div>`
     : `<div class="empty">${job('gate') || job('review') ? 'Claude is reading the change. This takes a minute or two.'
       : 'No guide yet. One is written after every gate pass, and an in-depth one when the ticket reaches review: why, a summary, the big picture and data flow diagrams, and a reading order that links to every change.'}</div>`}</div></section>`;
+}
+
+// ---------- change graph: the changed symbols, the calls between them, and the turn that wrote each one.
+// Built by VS Code (graph.js) and stored by server.js. Selecting, isolating a chain and the turn slider
+// only toggle classes on the drawn SVG, so the layout never moves.
+const cgView = {}; // task → { sel: node id, chain: index, turn: index }, kept across live repaints
+const cgAsked = new Set(); // "task|tree": VS Code is asked to build once per code tree
+const cgBusy = new Set();  // tasks VS Code is building a graph for right now (it says when it starts and stops)
+const cgOf = task => ST.graphs?.[task];
+const cgSec = task => document.querySelector(`section.cg[data-t="${CSS.escape(task)}"]`);
+const cgName = n => n.kind === 'file' ? n.file.split('/').pop() : n.name;
+const cgTurnColor = t => t == null ? css('--fg-2') : css(`--s${(t - 1) % 8 + 1}`);
+// Open comments and drafts per node: each goes to the innermost node whose file and lines hold it.
+// One with no line is about the whole file: its file node, else every node of that file.
+function cgOpen(task, g) {
+  const per = g.nodes.map(() => []), span = n => n.kind === 'file' ? Infinity : (n.endLine || n.line) - n.line;
+  for (const c of [...openItems(task), ...(ST.drafts?.[task] || [])]) {
+    if (!c.line) {
+      const mine = g.nodes.flatMap((n, i) => n.file === c.file ? [i] : []), f = mine.find(i => g.nodes[i].kind === 'file');
+      (f != null ? [f] : mine).forEach(i => per[i].push(c));
+      continue;
+    }
+    let best = -1;
+    g.nodes.forEach((n, i) => {
+      if (n.file !== c.file || (n.kind !== 'file' && !(c.line >= n.line && c.line <= (n.endLine || n.line)))) return;
+      if (best < 0 || span(n) < span(g.nodes[best])) best = i;
+    });
+    if (best >= 0) per[best].push(c);
+  }
+  return per;
+}
+// One subgraph per file in node order, nodes N<index>. Border = the turn that last changed it (dashed: no
+// recorded turn), filled = added, red fill = deleted file, rounded = an unchanged node linking two changes.
+const cgStatusColor = s => css(s === 'added' ? '--untracked' : s === 'deleted' ? '--del' : '--mod');
+function cgMermaid(r, g) {
+  const ix = new Map(g.nodes.map((n, i) => [n.id, i])), open = cgOpen(r.task, g), out = ['flowchart LR'];
+  [...new Set(g.nodes.map(n => n.file))].forEach((f, fi) => {
+    out.push(`  subgraph F${fi}[${q(f)}]`);
+    g.nodes.forEach((n, i) => {
+      if (n.file !== f) return;
+      const label = q(`${cgName(n)}${n.status === 'context' ? '' : `  +${n.add || 0} −${n.del || 0}`}${open[i].length ? ` · ${open[i].length} open` : ''}`);
+      out.push(`    N${i}${n.status === 'context' ? `([${label}])` : `[${label}]`}`);
+    });
+    out.push('  end');
+  });
+  for (const e of g.edges || []) if (ix.has(e.from) && ix.has(e.to)) out.push(`  N${ix.get(e.from)} --> N${ix.get(e.to)}`);
+  // Fill: what kind of change, in the file list's colours. Border: the turn that last changed it,
+  // dashed in the fill's colour when no recorded turn did.
+  g.nodes.forEach((n, i) => {
+    const fill = cgStatusColor(n.status);
+    out.push(`  style N${i} ${n.status === 'context' ? `stroke:${css('--fg-2')},stroke-width:1px,stroke-dasharray:2`
+      : `fill:${fill},fill-opacity:0.3,stroke-width:2px,${n.turn == null ? `stroke:${fill},stroke-dasharray:5` : `stroke:${cgTurnColor(n.turn)}`}`}`);
+  });
+  return out.join('\n');
+}
+const cgTurnText = (turns, i) => { const t = turns[i];
+  return `<span class="sw" style="--c:${cgTurnColor(t.n)}"></span> Turn ${+t.n} of ${turns.length} · ${esc(when(t.at))}${i === turns.length - 1 ? ' · all changes' : ''} · <span class="muted">${esc(t.prompt)}</span>`; };
+function graphSection(r) {
+  if (!r) return '';
+  const g = cgOf(r.task), tree = r.harness?.tree, task = esc(r.task);
+  const busy = cgBusy.has(r.task);
+  const build = VS && r.codeDir ? `<button class="btn" data-act="cg-build" data-t="${task}" ${busy ? 'disabled' : ''} title="Build the graph again from the worker's code">${busy ? `${ic('loading', 'codicon-modifier-spin')} Building…` : `${ic('refresh')} ${g ? 'Rebuild' : 'Build'}`}</button>` : '';
+  if (!g?.nodes?.length) return `<section class="cg" data-t="${task}"><h2>Change graph <span class="aside">${build}</span></h2><div class="card"><div class="empty">${busy ? 'Building the graph: asking the language servers for symbols and calls…' : g?.nodes ? `No changed symbols in tree ${esc(String(g.tree).slice(0, 7))}.` : !VS ? 'No graph yet. Open in VS Code to build it.'
+    : r.codeDir ? 'No graph yet. VS Code builds it from the worker\'s code when the agent is not working.' : 'No worker holds this branch, so there is no code to build a graph from.'}</div></div></section>`;
+  const nodes = g.nodes, chains = g.chains || [], turns = g.turns || [], inChain = new Set(chains.flat()), byId = new Map(nodes.map(n => [n.id, n]));
+  const alone = nodes.filter(n => !inChain.has(n.id)), gate = r.harness?.steps?.find(s => s.key === 'gate' && s.state !== 'off');
+  const ti = Math.min(cgView[r.task]?.turn ?? turns.length - 1, turns.length - 1);
+  const where = n => `${n.file}${n.kind === 'file' ? '' : ':' + n.line}`;
+  return `<section class="cg" data-t="${task}"><h2>Change graph <span class="aside">${build}</span></h2><div class="card">
+    <div class="card-h" style="flex-wrap:wrap;font-weight:400"><span>${plural(nodes.filter(n => n.status !== 'context').length, 'symbol')} · ${plural(chains.length, 'chain')} · ${alone.length} standalone</span>
+      <span class="aside"><span class="mono">${esc(String(g.tree).slice(0, 7))}</span> · built ${esc(ago(g.builtAt))}</span></div>
+    <div class="card-b">${tree && g.tree !== tree ? `<div class="callout">${ic('history')}<div>Built for older code.${build ? ' Rebuild to see the current code.' : ''}</div></div>` : ''}
+      ${tree && g.tree === tree && gate ? `<div class="hs" style="margin-bottom:8px"><span class="hs-s ${gate.state}">${ic(...HS[gate.state])}<span class="t">${esc(gate.text)}</span></span></div>` : ''}
+      ${g.truncated ? `<div class="callout">${ic('info')}<div>Showing files: more than 60 changed symbols</div></div>` : ''}
+      <div class="legend">${['added', 'modified', 'deleted'].map(s => `<span><i class="sw" style="--c:${cgStatusColor(s)}"></i>${s}</span>`).join('')}
+        ${turns.length ? `<span>border:</span>${turns.slice(-8).map(t => `<span><i class="sw" style="--c:${cgTurnColor(t.n)}"></i>Turn ${+t.n}</span>`).join('')}` : ''}<span>dashed: not from a recorded turn</span><span>rounded: unchanged, links two changes</span>
+        <span class="aside" title="Drag or scroll to move. Pinch or ⌘/Ctrl + scroll to zoom at the pointer.">
+          <button class="btn" data-act="cg-zoom" data-t="${task}" data-k="0.8" aria-label="Zoom in">${ic('zoom-in')}</button><button class="btn" data-act="cg-zoom" data-t="${task}" data-k="1.25" aria-label="Zoom out">${ic('zoom-out')}</button><button class="btn" data-act="cg-fit" data-t="${task}">${ic('screen-normal')} Fit</button></span></div>
+      ${mmd(cgMermaid(r, g))}</div>
+    ${turns.length ? `<div class="scrub" style="border-top:1px solid var(--border)"><input type="range" min="0" max="${turns.length - 1}" value="${ti}" data-cg-turn="${task}" aria-label="Show the changes up to this turn"><span class="small cg-turn">${cgTurnText(turns, ti)}</span></div>` : ''}
+    <div class="files" style="border-top:1px solid var(--border)">
+      ${chains.length ? `<div class="group">Chains · ${chains.length}</div>` + chains.map((c, i) => `<div class="row"><button class="row-main" data-act="cg-chain" data-t="${task}" data-i="${i}" aria-pressed="false" title="Show only this chain">
+        <span class="badge">${c.length}</span><span class="grow l1">${c.map(id => esc(byId.has(id) ? cgName(byId.get(id)) : id)).join(' → ')}</span></button></div>`).join('') : ''}
+      ${alone.length ? `<div class="group">Standalone · ${alone.length}</div>` + alone.map(n => `<div class="row"><button class="row-main" data-act="cg-node" data-t="${task}" data-id="${esc(n.id)}">
+        <span class="grow l1">${esc(cgName(n))} <span class="muted mono small">${esc(where(n))}</span></span></button></div>`).join('') : ''}</div></div></section>`;
+}
+// After each draw: make every node a button, then put the selection, chain and turn back.
+function wireGraph(root) {
+  for (const sec of root.querySelectorAll('section.cg[data-t]')) {
+    const task = sec.dataset.t, g = cgOf(task);
+    if (!g?.nodes) continue;
+    for (const el of sec.querySelectorAll('.mmd svg g.node')) {
+      const m = (el.id || '').match(/flowchart-N(\d+)-\d+$/), n = m && g.nodes[+m[1]];
+      if (!n || el.dataset.cg) continue;
+      el.dataset.cg = m[1]; el.classList.add('hot'); el.setAttribute('tabindex', '0'); el.setAttribute('role', 'button');
+      el.setAttribute('aria-label', `${cgName(n)}, ${n.status}, ${n.file}`);
+      el.addEventListener('click', () => cgSelect(task, n.id, el));
+      el.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); cgSelect(task, n.id, el); } });
+      el.addEventListener('focus', () => { (cgView[task] ||= {}).focus = n.id; });
+      el.addEventListener('blur', e => { if (e.relatedTarget) delete cgView[task].focus; }); // a repaint removes it with no relatedTarget
+    }
+    const f = cgView[task]?.focus;
+    if (f != null && (!document.activeElement || document.activeElement === document.body)) sec.querySelector(`g.node[data-cg="${g.nodes.findIndex(n => n.id === f)}"]`)?.focus({ preventScroll: true });
+    cgPanZoom(sec, task);
+    cgApply(task);
+  }
+}
+// Pan and zoom by moving the SVG's viewBox. Drag or scroll moves; pinch or ⌘/Ctrl + scroll zooms at
+// the pointer. The view is kept per task (until the layout changes), so a live repaint keeps it.
+const cgVB = {};
+function cgPanZoom(sec, task) {
+  const svg = sec.querySelector('.mmd svg'), vb = svg?.getAttribute('viewBox');
+  if (!vb || svg.cgZoom) return;
+  const home = vb.split(/[\s,]+/).map(Number);
+  if (cgVB[task]?.home !== vb) cgVB[task] = { home: vb, v: home.slice() };
+  const v = cgVB[task].v, show = () => svg.setAttribute('viewBox', v.join(' '));
+  svg.style.maxWidth = 'none'; svg.style.width = '100%'; svg.style.height = `${Math.round(Math.min(innerHeight * 0.7, Math.max(260, home[3])))}px`;
+  show();
+  const unit = () => 1 / svg.getScreenCTM().a; // SVG units per screen pixel
+  svg.cgZoom = (k, x, y) => { // k < 1 zooms in, around the screen point x, y
+    k = Math.min(Math.max(k, home[2] / 20 / v[2]), home[2] * 4 / v[2]);
+    const p = new DOMPoint(x, y).matrixTransform(svg.getScreenCTM().inverse());
+    v[0] = p.x - (p.x - v[0]) * k; v[1] = p.y - (p.y - v[1]) * k; v[2] *= k; v[3] *= k; show();
+  };
+  svg.cgFit = () => { v.splice(0, 4, ...home); show(); };
+  svg.addEventListener('wheel', e => {
+    e.preventDefault();
+    if (e.ctrlKey || e.metaKey) return svg.cgZoom(Math.exp(e.deltaY * 0.01), e.clientX, e.clientY); // a trackpad pinch arrives as ctrl + wheel
+    const u = unit(); v[0] += e.deltaX * u; v[1] += e.deltaY * u; show();
+  }, { passive: false });
+  let drag = null;
+  svg.addEventListener('pointerdown', e => { if (!e.button) drag = { x: e.clientX, y: e.clientY, moved: false }; });
+  svg.addEventListener('pointermove', e => {
+    if (!drag || !(e.buttons & 1)) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (!drag.moved && Math.hypot(dx, dy) < 4) return; // a click on a node, not a drag
+    if (!drag.moved) { drag.moved = true; svg.setPointerCapture(e.pointerId); svg.classList.add('panning'); }
+    const u = unit(); v[0] -= dx * u; v[1] -= dy * u; drag.x = e.clientX; drag.y = e.clientY; show();
+  });
+  const end = () => { svg.classList.remove('panning'); setTimeout(() => (drag = null)); };
+  svg.addEventListener('pointerup', end); svg.addEventListener('pointercancel', end);
+  svg.addEventListener('click', e => { if (drag?.moved) { e.stopPropagation(); e.preventDefault(); } }, true); // the end of a drag is not a click
+}
+function cgApply(task) {
+  const sec = cgSec(task), g = cgOf(task), v = cgView[task] || {};
+  if (!sec || !g?.nodes) return;
+  const chain = g.chains?.[v.chain] && new Set(g.chains[v.chain]), k = v.turn != null ? g.turns?.[v.turn]?.n : null;
+  const sel = g.nodes.some(n => n.id === v.sel) ? v.sel : null; // a rebuild can drop the selected node
+  const near = new Set((g.edges || []).flatMap(e => e.from === sel ? [e.to] : e.to === sel ? [e.from] : []));
+  // Chain and turn filters dim first; then a selection dims everything but itself and its neighbours.
+  const filtered = n => (chain && !chain.has(n.id)) || (k != null && n.firstTurn != null && n.firstTurn > k);
+  const dim = n => n.id !== sel && (filtered(n) || (sel != null && !near.has(n.id)));
+  for (const el of sec.querySelectorAll('g.node[data-cg]')) {
+    const n = g.nodes[+el.dataset.cg];
+    el.classList.toggle('cg-sel', n.id === sel); el.classList.toggle('cg-near', near.has(n.id)); el.classList.toggle('cg-dim', dim(n));
+  }
+  // Edge ids carry both ends: L_N0_N2_0 (older Mermaid: L-N0-N2-0).
+  for (const p of sec.querySelectorAll('.mmd svg path[id*="L"]')) {
+    const m = p.id.match(/L[_-]N(\d+)[_-]N(\d+)[_-]\d+$/), a = m && g.nodes[+m[1]], b = m && g.nodes[+m[2]];
+    if (!a || !b) continue;
+    p.classList.toggle('cg-hot', sel != null && (a.id === sel || b.id === sel)); p.classList.toggle('cg-dim', dim(a) || dim(b));
+  }
+  for (const b of sec.querySelectorAll('[data-act="cg-chain"]')) { const on = +b.dataset.i === v.chain; b.setAttribute('aria-pressed', on); b.parentElement.classList.toggle('sel', on); }
+  for (const b of sec.querySelectorAll('[data-act="cg-node"]')) b.parentElement.classList.toggle('sel', b.dataset.id === sel);
+}
+function cgSelect(task, id, anchor) {
+  const g = cgOf(task), r = recOf(task), i = g.nodes.findIndex(n => n.id === id), n = g.nodes[i];
+  if (!n) return;
+  (cgView[task] ||= {}).sel = id; cgApply(task);
+  const el = cgSec(task)?.querySelector(`g.node[data-cg="${i}"]`) || anchor;
+  const t = (g.turns || []).find(x => x.n === n.turn), open = cgOpen(task, g)[i], line = n.kind === 'file' ? null : n.line;
+  popover(el, `<div class="pop-h"><span class="fst ${{ added: 'fst-new', modified: 'fst-modified', deleted: 'fst-deleted', context: 'fst-context' }[n.status] || ''}">${esc(n.status === 'context' ? 'unchanged' : n.status)}</span><b>${esc(cgName(n))}</b><span class="muted small">${esc(n.kind)}</span></div>
+    <div class="mono small">${esc(n.file)}${line ? ':' + +line : ''} &nbsp;<span class="add">+${+n.add || 0}</span> <span class="del">−${+n.del || 0}</span></div>
+    <blockquote class="pop-q">${t ? `Turn ${+t.n} · ${esc(when(t.at))}\n${esc(t.prompt)}` : n.status === 'context' ? 'Unchanged. It links two changed symbols.' : 'Not from a recorded turn.'}</blockquote>
+    ${open.length ? `<div class="small" style="display:grid;gap:4px">${open.map(c => `<div>${c.line ? `<span class="mono muted">line ${c.line}</span> ` : ''}${'replies' in c ? '' : '<span class="pill pill-draft">Draft</span> '}${annText(c.text)}</div>`).join('')}</div>` : ''}
+    <div class="pop-foot">${r?.mergeBase ? `<button class="btn" data-pop="diff">${ic('diff')} Diff</button><button class="btn" data-pop="peek">${ic('eye')} Preview</button>` : ''}<button class="btn primary" data-pop="annotate">${ic('comment')} Annotate</button></div>`,
+    { diff: () => act('diff', { dir: r.codeDir || ST.snap.repoDir, file: n.file, rev: r.mergeBase, right: r.codeDir ? undefined : r.branch, line: line || '' }),
+      peek: () => cgPeek(task, n.file, line || '', el),
+      annotate: () => annotate(task, el, cgName(n), { file: n.file, line }) });
+  el.focus?.({ preventScroll: true }); // keeps j / k in the graph
+}
+// j / k inside the graph: through the chains in order, then the standalone nodes. Escape clears.
+function cgKey(e) {
+  const sec = e.target.closest('section.cg'), task = sec?.dataset.t, g = task && cgOf(task);
+  if (!g?.nodes || e.metaKey || e.ctrlKey || e.altKey || e.target.closest('input,textarea,select')) return false;
+  if (e.key === 'Escape') { if (!pop().hidden) closePop(); else { cgView[task] = { turn: cgView[task]?.turn }; cgApply(task); } return true; }
+  if (e.key !== 'j' && e.key !== 'k') return false;
+  e.preventDefault();
+  const flat = (g.chains || []).flat(), seen = new Set(flat), order = [...flat, ...g.nodes.map(n => n.id).filter(id => !seen.has(id))].filter(id => g.nodes.some(n => n.id === id));
+  const cur = e.target.closest('g.node[data-cg]'), at = order.indexOf(cur ? g.nodes[+cur.dataset.cg].id : cgView[task]?.sel);
+  const next = order[at < 0 ? (e.key === 'j' ? 0 : order.length - 1) : (at + (e.key === 'j' ? 1 : order.length - 1)) % order.length];
+  sec.querySelector(`g.node[data-cg="${g.nodes.findIndex(n => n.id === next)}"]`)?.focus();
+  return true;
+}
+// In VS Code, ask for a build once per code tree when the graph is missing or older than the code and the agent is not working.
+function cgAutoBuild(r) {
+  const tree = r.harness?.tree;
+  if (!VS || !r.codeDir || !tree || cgOf(r.task)?.tree === tree || cgAsked.has(`${r.task}|${tree}`)) return;
+  if (ST.snap.workers.find(w => w.ticket === r.task)?.phase?.key === 'working') return;
+  cgAsked.add(`${r.task}|${tree}`); act('graph', { task: r.task });
 }
 // Guide file links become diff links.
 function wireGuide(md) {
@@ -1062,6 +1311,7 @@ function ticketPage(key) {
       ${r.harness ? `<div style="margin-top:12px">${harnessStrip(r.harness, 'big')}</div>` : ''}</div>
     <div class="actions">${openBtn(r.lastSession, 'Continue last session', true)}</div></div>
     ${guideSection(r)}
+    ${graphSection(r)}
     <section><h2>Timeline <span class="aside muted">${r.timeline.length} ${r.timeline.length === 1 ? 'entry' : 'entries'} · newest first</span></h2><div class="card">${timelineView(r.timeline, 12, r.task)}</div></section>`;
 }
 
@@ -1092,6 +1342,7 @@ function workerPage(w) {
       ${sid && open.length ? `<button class="btn" data-act="send" data-sid="${esc(sid)}" data-file="${esc(reviewFile)}">${ic('send')} Send ${plural(open.length, 'comment')} to agent</button>` : ''}</div></div>
     ${w.state === 'INTERRUPTED' ? `<div class="callout" style="margin-top:16px">${ic('debug-pause')}<div>The session holding ${esc(w.ticket)} ended with ${plural(w.dirty || 0, 'uncommitted file')}. Nothing here gets collected. Continue that conversation with Open session, or start a new session and run <span class="mono">fleet claim ${esc(w.ticket)}</span>: it adopts this worker, uncommitted work included.</div></div>` : ''}
     ${guideSection(w.record)}
+    ${graphSection(w.record)}
     <section><h2>Conversation</h2><div class="card list">
       ${si.lastPrompt ? `<div class="item"><span class="muted">${ic('account')}</span><div class="clamp">${esc(si.lastPrompt)}</div><span class="muted num small">${esc(ago(si.at))}</span></div>` : ''}
       ${si.lastReply ? `<div class="item"><span class="muted">${ic('sparkle')}</span><div class="clamp clamp4">${esc(si.lastReply)}</div><span class="muted small">${w.phase?.key === 'working' ? 'working…' : 'agent'}</span></div>` : ''}
@@ -1151,6 +1402,8 @@ function render() {
   const content = document.getElementById('content'), main = document.getElementById('main');
   const w = ST.snap.workers.find(x => x.name === sel);
   const top = main.scrollTop;
+  const rec = w ? w.record : sel.startsWith('task:') ? recOf(sel.slice(5)) : null;
+  if (rec) cgAutoBuild(rec);
   if (!paint(content, w ? workerPage(w) : sel === 'lanes' ? lanesPage() : sel.startsWith('task:') ? ticketPage(sel.slice(5)) : overviewPage())) return;
   for (const el of content.querySelectorAll('.md[data-md]')) {
     const html = window.marked ? marked.parse(decodeURIComponent(el.dataset.md)) : `<pre>${esc(decodeURIComponent(el.dataset.md))}</pre>`;
@@ -1160,7 +1413,7 @@ function render() {
   for (const md of content.querySelectorAll('.md.guide')) { wireGuide(md); decorateGuide(md); markAnnotations(md); }
   applyPeeks(content);
   main.scrollTop = top;
-  drawMermaid(content).then(() => wireDiagrams(content));
+  drawMermaid(content).then(() => { wireDiagrams(content); wireGraph(content); });
 }
 // Screen readers hear the moments that matter, not every repaint.
 function announce(prev, next) {
@@ -1180,9 +1433,16 @@ document.addEventListener('input', e => {
     document.getElementById('scrub-at').textContent = when(fr[i].at) + (scrub == null ? ' · now' : '');
     document.getElementById('scrub-body').innerHTML = frameView(fr[i]);
   }
+  if (t.matches('[data-cg-turn]')) {
+    const task = t.dataset.cgTurn, turns = cgOf(task)?.turns;
+    if (!turns?.[+t.value]) return; // the graph changed under the held repaint
+    (cgView[task] ||= {}).turn = +t.value;
+    t.nextElementSibling.innerHTML = cgTurnText(turns, +t.value);
+    cgApply(task);
+  }
 });
-// Hold live repaints while the scrubber is being dragged, so the handle doesn't jump.
-document.addEventListener('pointerdown', e => { if (e.target.matches('[data-scrub]')) scrubbing = true; });
+// Hold live repaints while a scrubber or the graph's turn slider is dragged, so the handle doesn't jump.
+document.addEventListener('pointerdown', e => { if (e.target.matches('[data-scrub], [data-cg-turn]')) scrubbing = true; });
 document.addEventListener('pointerup', () => { if (scrubbing) { scrubbing = false; render(); } });
 document.addEventListener('change', e => { if (e.target.matches('[data-scrub]')) render(); });
 
@@ -1249,9 +1509,15 @@ document.addEventListener('click', async e => {
     case 'export': return exportGuide(d.t, d.kind, d.to).catch(err => toast('Export failed: ' + err.message));
     case 'resolve': return post('/api/resolve', { worker: d.w, index: +d.i, done: t.checked });
     case 'comment': return comment(w, d.file);
+    case 'cg-build': return act('graph', { task: d.t, force: true });
+    case 'cg-chain': { const v = (cgView[d.t] ||= {}); v.chain = v.chain === +d.i ? null : +d.i; return cgApply(d.t); }
+    case 'cg-node': return cgSelect(d.t, d.id, t);
+    case 'cg-zoom': { const s = cgSec(d.t)?.querySelector('.mmd svg'), b = s?.getBoundingClientRect(); return b && s.cgZoom?.(+d.k, b.left + b.width / 2, b.top + b.height / 2); }
+    case 'cg-fit': return cgSec(d.t)?.querySelector('.mmd svg')?.cgFit?.();
   }
 });
 document.addEventListener('keydown', e => {
+  if (e.target.closest?.('section.cg') && cgKey(e)) return; // the graph's own j / k / Escape
   if (e.key === 'Escape' && !pop().hidden) return closePop();
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && e.target.closest('#pop')) { e.preventDefault(); return (popActions.add || popActions.submit)?.(); }
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && e.target.closest('.reply-box')) { e.preventDefault(); return e.target.closest('.reply-box').requestSubmit(); }
@@ -1290,7 +1556,10 @@ new MutationObserver(() => { setupMermaid(); painted = {}; render(); }).observe(
 setupMermaid();
 
 // live state
-window.addEventListener('message', e => { if (e.data?.type === 'select') select(e.data.sel); });
+window.addEventListener('message', e => {
+  if (e.data?.type === 'select') select(e.data.sel);
+  if (e.data?.type === 'cg-busy') { e.data.on ? cgBusy.add(e.data.task) : cgBusy.delete(e.data.task); if (ST) render(); }
+});
 function connect() {
   const es = new EventSource(`${CFG.server}/events?token=${encodeURIComponent(CFG.token)}`);
   const conn = document.getElementById('conn');

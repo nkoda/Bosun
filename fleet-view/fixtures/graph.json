@@ -1,0 +1,28 @@
+{
+  "v": 1, "task": "T-1", "tree": "0123456789abcdef0123456789abcdef01234567", "base": "89abcdef0123456789abcdef0123456789abcdef", "builtAt": "2026-11-19T09:00:00.000Z",
+  "lsp": { "files": 5, "withSymbols": 4 },
+  "truncated": false,
+  "turns": [
+    { "n": 1, "at": "2026-11-19T08:00:00.000Z", "session": "11111111-1111-1111-1111-111111111111", "prompt": "Add a checkout API with input validation." },
+    { "n": 2, "at": "2026-11-19T08:20:00.000Z", "session": "11111111-1111-1111-1111-111111111111", "prompt": "Cart.total should include tax. <script>alert(2)</script>" },
+    { "n": 3, "at": "2026-11-19T08:40:00.000Z", "session": "11111111-1111-1111-1111-111111111111", "prompt": "Round tax to cents and note it in the README." }
+  ],
+  "nodes": [
+    { "id": "src/api.js#checkout", "file": "src/api.js", "name": "checkout", "kind": "function", "line": 1, "endLine": 30, "status": "added", "add": 30, "del": 0, "turn": 1, "firstTurn": 1 },
+    { "id": "src/api.js#validate", "file": "src/api.js", "name": "validate", "kind": "function", "line": 32, "endLine": 40, "status": "added", "add": 9, "del": 0, "turn": null, "firstTurn": null },
+    { "id": "src/cart.js#Cart.total", "file": "src/cart.js", "name": "Cart.total", "kind": "method", "line": 10, "endLine": 24, "status": "modified", "add": 3, "del": 1, "turn": 2, "firstTurn": 1 },
+    { "id": "src/tax.js#rate", "file": "src/tax.js", "name": "rate", "kind": "function", "line": 3, "endLine": 8, "status": "context", "add": 0, "del": 0, "turn": null, "firstTurn": null },
+    { "id": "src/tax.js#tax", "file": "src/tax.js", "name": "tax", "kind": "function", "line": 12, "endLine": 20, "status": "modified", "add": 4, "del": 2, "turn": 3, "firstTurn": 3 },
+    { "id": "src/util.js#<img src=x onerror=alert(1)>", "file": "src/util.js", "name": "<img src=x onerror=alert(1)>", "kind": "function", "line": 5, "endLine": 9, "status": "modified", "add": 2, "del": 2, "turn": 2, "firstTurn": 2 },
+    { "id": "README.md", "file": "README.md", "name": "README.md", "kind": "file", "line": 1, "endLine": 1, "status": "modified", "add": 2, "del": 0, "turn": 3, "firstTurn": 3 }
+  ],
+  "edges": [
+    { "from": "src/api.js#checkout", "to": "src/api.js#validate" },
+    { "from": "src/cart.js#Cart.total", "to": "src/tax.js#rate" },
+    { "from": "src/tax.js#rate", "to": "src/tax.js#tax" }
+  ],
+  "chains": [
+    ["src/cart.js#Cart.total", "src/tax.js#rate", "src/tax.js#tax"],
+    ["src/api.js#checkout", "src/api.js#validate"]
+  ]
+}
