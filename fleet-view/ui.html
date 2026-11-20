@@ -877,6 +877,7 @@ function wireGraph(root) {
       el.dataset.cg = m[1]; el.classList.add('hot'); el.setAttribute('tabindex', '0'); el.setAttribute('role', 'button');
       el.setAttribute('aria-label', `${cgName(n)}, ${n.status}, ${n.file}`);
       el.addEventListener('click', () => cgSelect(task, n.id, el));
+      el.addEventListener('dblclick', () => { closePop(); cgOpenNode(task, n); });
       el.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); cgSelect(task, n.id, el); } });
       el.addEventListener('focus', () => { (cgView[task] ||= {}).focus = n.id; });
       el.addEventListener('blur', e => { if (e.relatedTarget) delete cgView[task].focus; }); // a repaint removes it with no relatedTarget
@@ -886,6 +887,24 @@ function wireGraph(root) {
     cgPanZoom(sec, task);
     cgApply(task);
   }
+}
+// Into the code: the worker's file at the node, beside the dashboard. The cursor landing there
+// comes back as cg-cursor, so the graph keeps showing where you are.
+function cgOpenNode(task, n) {
+  const r = ST.snap.records.find(x => x.task === task);
+  if (VS && r?.codeDir && n.status !== 'deleted') act('open', { dir: r.codeDir, file: n.file, line: n.kind === 'file' ? '' : n.line, beside: true });
+}
+// The editor's cursor moved in a worker's file: select the innermost node holding it, and bring it into view.
+function cgCursor({ task, file, line }) {
+  const g = cgOf(task), sec = cgSec(task);
+  if (!g?.nodes || !sec) return;
+  const n = g.nodes.filter(x => x.file === file && x.line <= line && line <= x.endLine)
+    .sort((a, b) => (a.kind === 'file') - (b.kind === 'file') || (a.endLine - a.line) - (b.endLine - b.line))[0];
+  const v = (cgView[task] ||= {});
+  if (!n || v.sel === n.id) return;
+  v.sel = n.id; cgApply(task);
+  const el = sec.querySelector(`g.node[data-cg="${g.nodes.indexOf(n)}"]`), svg = sec.querySelector('.mmd svg');
+  if (el && svg?.cgShow) svg.cgShow(el);
 }
 // Pan and zoom by moving the SVG's viewBox. Drag or scroll moves; pinch or ⌘/Ctrl + scroll zooms at
 // the pointer. The view is kept per task (until the layout changes), so a live repaint keeps it.
@@ -905,6 +924,12 @@ function cgPanZoom(sec, task) {
     v[0] = p.x - (p.x - v[0]) * k; v[1] = p.y - (p.y - v[1]) * k; v[2] *= k; v[3] *= k; show();
   };
   svg.cgFit = () => { v.splice(0, 4, ...home); show(); };
+  svg.cgShow = el => { // pan (same zoom) until the node is in view, and scroll the page to the graph if it is off screen
+    const s = svg.getBoundingClientRect(), b = el.getBoundingClientRect();
+    if (s.bottom < 0 || s.top > innerHeight) svg.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    if (b.left >= s.left && b.right <= s.right && b.top >= s.top && b.bottom <= s.bottom) return;
+    const u = unit(); v[0] += (b.left + b.width / 2 - s.left - s.width / 2) * u; v[1] += (b.top + b.height / 2 - s.top - s.height / 2) * u; show();
+  };
   svg.addEventListener('wheel', e => {
     e.preventDefault();
     if (e.ctrlKey || e.metaKey) return svg.cgZoom(Math.exp(e.deltaY * 0.01), e.clientX, e.clientY); // a trackpad pinch arrives as ctrl + wheel
@@ -955,8 +980,9 @@ function cgSelect(task, id, anchor) {
     <div class="mono small">${esc(n.file)}${line ? ':' + +line : ''} &nbsp;<span class="add">+${+n.add || 0}</span> <span class="del">−${+n.del || 0}</span></div>
     <blockquote class="pop-q">${t ? `Turn ${+t.n} · ${esc(when(t.at))}\n${esc(t.prompt)}` : n.status === 'context' ? 'Unchanged. It links two changed symbols.' : 'Not from a recorded turn.'}</blockquote>
     ${open.length ? `<div class="small" style="display:grid;gap:4px">${open.map(c => `<div>${c.line ? `<span class="mono muted">line ${c.line}</span> ` : ''}${'replies' in c ? '' : '<span class="pill pill-draft">Draft</span> '}${annText(c.text)}</div>`).join('')}</div>` : ''}
-    <div class="pop-foot">${r?.mergeBase ? `<button class="btn" data-pop="diff">${ic('diff')} Diff</button><button class="btn" data-pop="peek">${ic('eye')} Preview</button>` : ''}<button class="btn primary" data-pop="annotate">${ic('comment')} Annotate</button></div>`,
-    { diff: () => act('diff', { dir: r.codeDir || ST.snap.repoDir, file: n.file, rev: r.mergeBase, right: r.codeDir ? undefined : r.branch, line: line || '' }),
+    <div class="pop-foot">${VS && r?.codeDir && n.status !== 'deleted' ? `<button class="btn" data-pop="open" title="Open it in the editor (or double-click the node)">${ic('go-to-file')} Open</button>` : ''}${r?.mergeBase ? `<button class="btn" data-pop="diff">${ic('diff')} Diff</button><button class="btn" data-pop="peek">${ic('eye')} Preview</button>` : ''}<button class="btn primary" data-pop="annotate">${ic('comment')} Annotate</button></div>`,
+    { open: () => { closePop(); cgOpenNode(task, n); },
+      diff: () => act('diff', { dir: r.codeDir || ST.snap.repoDir, file: n.file, rev: r.mergeBase, right: r.codeDir ? undefined : r.branch, line: line || '' }),
       peek: () => cgPeek(task, n.file, line || '', el),
       annotate: () => annotate(task, el, cgName(n), { file: n.file, line }) });
   el.focus?.({ preventScroll: true }); // keeps j / k in the graph
@@ -1558,6 +1584,7 @@ setupMermaid();
 // live state
 window.addEventListener('message', e => {
   if (e.data?.type === 'select') select(e.data.sel);
+  if (e.data?.type === 'cg-cursor') cgCursor(e.data);
   if (e.data?.type === 'cg-busy') { e.data.on ? cgBusy.add(e.data.task) : cgBusy.delete(e.data.task); if (ST) render(); }
 });
 function connect() {

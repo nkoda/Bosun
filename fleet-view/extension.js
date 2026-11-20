@@ -51,7 +51,7 @@ function activate(ctx) {
   function makeFleet(dir) {
     const home = path.join(dir, '.fleet-view');
     fs.mkdirSync(home, { recursive: true });
-    const F = { dir, name: path.basename(dir).replace(/-fleet$/, ''), state: null, panel: null, seen: null, workingSince: {}, threads: new Map(), sig: '' };
+    const F = { dir, name: path.basename(dir).replace(/-fleet$/, ''), state: null, panel: null, seen: null, workingSince: {}, threads: new Map(), sig: '', views: new Set() };
     F.token = () => { try { return fs.readFileSync(path.join(home, 'token'), 'utf8').trim(); } catch { return ''; } };
     F.port = () => { try { return JSON.parse(fs.readFileSync(path.join(home, 'server.json'), 'utf8')).port; } catch { return null; } };
     F.base = () => `http://127.0.0.1:${F.port()}`;
@@ -240,7 +240,9 @@ function activate(ctx) {
       if (m.type === 'open') {
         const uri = m.rev ? vscode.Uri.from({ scheme: 'fleet-git', path: '/' + m.file, query: JSON.stringify({ dir: m.dir, rev: m.rev }) }) : vscode.Uri.file(path.join(m.dir, m.file));
         const line = Math.max(0, (+m.line || 1) - 1);
-        await vscode.window.showTextDocument(uri, { preview: true, selection: new vscode.Range(line, 0, line, 0) });
+        // From the change graph: beside the dashboard, which keeps focus, so j / k still walk the graph.
+        await vscode.window.showTextDocument(uri, { preview: true, selection: new vscode.Range(line, 0, line, 0),
+          ...(m.beside ? { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true } : {}) });
       }
       if (m.type === 'url') vscode.env.openExternal(vscode.Uri.parse(m.url));
       if (m.type === 'dashboard') openPanel(F, m.sel);
@@ -262,8 +264,20 @@ function activate(ctx) {
         try { await buildGraph(F, m.task, m.force); } finally { webview.postMessage({ type: 'cg-busy', task: m.task, on: false }); }
       }
     }
-    return () => sub.dispose();
+    F.views.add(webview);
+    return () => { sub.dispose(); F.views.delete(webview); };
   }
+  // Where you are in a worker's file, for the change graph: the page selects the node holding the cursor.
+  let cursorTimer;
+  ctx.subscriptions.push(vscode.window.onDidChangeTextEditorSelection(e => {
+    clearTimeout(cursorTimer);
+    cursorTimer = setTimeout(() => {
+      const fsPath = e.textEditor.document.uri.fsPath, { F, w } = workerOf(fsPath);
+      if (!w?.ticket || e.textEditor.document.uri.scheme !== 'file') return;
+      const msg = { type: 'cg-cursor', task: w.ticket, file: path.relative(w.dir, fsPath).split(path.sep).join('/'), line: e.selections[0].active.line + 1 };
+      for (const v of F.views) v.postMessage(msg);
+    }, 150);
+  }));
   function openPanel(F, sel) {
     if (F.panel) { F.panel.reveal(); if (sel) F.panel.webview.postMessage({ type: 'select', sel }); return; }
     F.ensure().then(() => {
