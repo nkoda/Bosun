@@ -21,7 +21,7 @@ try { AUTHOR = execFileSync('git', ['config', 'user.name']).toString().trim() ||
 
 const HOME = path.join(FLEET, '.fleet-view');
 const OVERVIEWS = path.join(FLEET, 'scratchpad', 'overviews');
-for (const d of [HOME, path.join(HOME, 'sessions'), review.reviewDir(FLEET), OVERVIEWS, path.join(FLEET, '.locks'), path.join(FLEET, 'briefs')]) fs.mkdirSync(d, { recursive: true });
+for (const d of [HOME, path.join(HOME, 'sessions'), path.join(HOME, 'graphs'), review.reviewDir(FLEET), OVERVIEWS, path.join(FLEET, '.locks'), path.join(FLEET, 'briefs')]) fs.mkdirSync(d, { recursive: true });
 
 const tokenFile = path.join(HOME, 'token');
 if (!fs.existsSync(tokenFile)) fs.writeFileSync(tokenFile, crypto.randomBytes(24).toString('hex'), { mode: 0o600 });
@@ -50,14 +50,15 @@ async function refresh() {
       hist = { snap, prev: hist.snap || null, trans: moved.length ? moved : hist.trans || [], changedAt: snap.at, frames: [...(hist.frames || []), frame].slice(-200) };
       fs.writeFileSync(histFile, JSON.stringify(hist));
     }
-    const reviews = {}, drafts = {};
+    const reviews = {}, drafts = {}, graphs = {};
     for (const t of new Set([...snap.workers.map(w => w.ticket), ...snap.records.map(r => r.task)].filter(Boolean))) {
       const items = review.read(FLEET, t);
       if (items.length) reviews[t] = items;
       const d = review.drafts(FLEET, t);
       if (d.length) drafts[t] = d;
+      try { const g = JSON.parse(fs.readFileSync(path.join(HOME, 'graphs', `${t}.json`), 'utf8')); if (g?.task === t) graphs[t] = g; } catch {}
     }
-    state = { snap, agg: aggregate(snap), trans: hist.trans, changedAt: hist.changedAt, frames: hist.frames || [], reviews, drafts, jobs, port: PORT };
+    state = { snap, agg: aggregate(snap), trans: hist.trans, changedAt: hist.changedAt, frames: hist.frames || [], reviews, drafts, graphs, jobs, port: PORT };
     autoGuides(snap);
     push();
   } catch (e) { console.error(e); }
@@ -250,6 +251,16 @@ const server = http.createServer(async (req, res) => {
     soon(); return json({ ok: true });
   }
   if (url.pathname === '/api/draft-remove') { review.removeDraft(FLEET, task, +b.index); soon(); return json({ ok: true }); }
+  // The latest change graph per ticket (built in the extension by graph.js); its tree is the cache key.
+  if (url.pathname === '/api/graph') {
+    const g = b.graph;
+    if (g?.task !== task || typeof g?.tree !== 'string' || !/^[0-9a-f]{40,64}$/.test(g.tree)) return json({ error: 'bad graph' }, 400);
+    const s = JSON.stringify(g);
+    if (s.length > 1000000) return json({ error: 'graph too large' }, 413);
+    const f = path.join(HOME, 'graphs', `${task}.json`);
+    fs.writeFileSync(`${f}.tmp`, s); fs.renameSync(`${f}.tmp`, f);
+    soon(); return json({ ok: true });
+  }
   if (url.pathname === '/api/submit') { const n = review.submit(FLEET, task, { note: b.note, author: b.author || AUTHOR }); soon(); return json({ ok: true, n }); }
   // One file's diff for the inline preview: the worker's tree (uncommitted included) or the branch.
   if (url.pathname === '/api/diff') {
