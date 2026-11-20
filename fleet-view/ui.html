@@ -191,7 +191,10 @@ tr:last-child td { border-bottom: 0; }
 .div-track { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; height: 12px; }
 .div-track .l { display: flex; justify-content: flex-end; } .div-track .l span { background: var(--del); border-radius: 4px 0 0 4px; height: 100%; }
 .div-track .r span { display: block; background: var(--add); border-radius: 0 4px 4px 0; height: 100%; }
-.mmd { overflow-x: auto; min-height: 40px; } .mmd svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+.mmd { position: relative; overflow: hidden; min-height: 40px; } .mmd svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+.mmd svg[viewBox] { cursor: grab; user-select: none; touch-action: none; } .mmd svg.panning { cursor: grabbing; }
+.pz { position: absolute; top: 6px; right: 6px; display: flex; gap: 2px; opacity: 0; transition: opacity .15s; }
+.mmd:hover .pz, .pz:focus-within { opacity: 1; } .pz .btn { padding: 2px 4px; }
 #tip { position: fixed; pointer-events: none; z-index: 10; background: var(--bg-3); border: 1px solid var(--border); color: var(--fg); padding: 4px 8px; border-radius: 4px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.25); display: none; max-width: 320px; }
 
 /* review */
@@ -253,7 +256,6 @@ dialog textarea { background: var(--input); color: var(--fg); border: 1px solid 
 .gs-tests li.tw { color: var(--warn); }
 /* diagrams you can touch: changed boxes tinted, everything lights on hover */
 .md.guide .mmd svg .hot { cursor: pointer; }
-.zoom-b { float: right; margin: 0 0 4px 8px; } .md.guide .mmd.zoom { overflow: auto; max-height: 80vh; } .md.guide .mmd.zoom svg { max-width: none !important; width: auto; }
 .md.guide .mmd svg g.node.hot:is(:hover, :focus) > :is(rect, polygon, path, circle) { stroke: var(--focus) !important; stroke-width: 2px !important; }
 .md.guide .mmd svg text.hot:is(:hover, :focus) { fill: var(--link) !important; text-decoration: underline; }
 .md.guide .mmd svg g.node.changed > :is(rect, polygon, path, circle) { stroke: var(--link) !important; fill: color-mix(in srgb, var(--link) 14%, var(--bg-3)) !important; }
@@ -583,17 +585,18 @@ function branchGraph(w) {
   return out.join('\n');
 }
 
+const cmFiles = {}; // worker → { box id → file }, so a click on a change-map box knows its file
 function changeMap(w) {
   const fs_ = {}; for (const f of files(w)) { const x = (fs_[f.file] ||= { ...f, add: 0, del: 0 }); x.add += f.add || 0; x.del += f.del || 0; if (f.where === 'uncommitted') x.unc = true; }
   const list = Object.values(fs_).slice(0, 30);
   if (!list.length) return null;
   const areas = {};
   for (const f of list) { const seg = f.file.split('/'); (areas[seg.slice(0, Math.min(seg.length - 1, 3)).join('/') || '(root)'] ||= []).push(f); }
-  const out = ['flowchart LR', `  T[${q((w.ticket || w.branch) + ' · ' + w.name)}]`];
+  const out = ['flowchart LR', `  T[${q((w.ticket || w.branch) + ' · ' + w.name)}]`], boxes = cmFiles[w.name] = {};
   const colorOf = st => st === 'D' ? css('--del') : st === 'A' || st === '??' ? css('--untracked') : css('--mod');
   Object.entries(areas).forEach(([a, fl], i) => {
     out.push(`  A${i}([${q(a)}])`, `  T --> A${i}`);
-    fl.forEach((f, j) => out.push(`  A${i} --- F${i}_${j}[${q(`${f.file.split('/').pop()}  +${f.add} −${f.del}`)}]`,
+    fl.forEach((f, j) => (boxes[`F${i}_${j}`] = f.file) && out.push(`  A${i} --- F${i}_${j}[${q(`${f.file.split('/').pop()}  +${f.add} −${f.del}`)}]`,
       `  style F${i}_${j} stroke:${colorOf(f.status)},stroke-width:2px${f.unc ? ',stroke-dasharray:4' : ''}`));
   });
   out.push(`  style T stroke:${color(w.name).replace(/var\((.*)\)/, (_, v) => css(v))},stroke-width:3px`);
@@ -747,8 +750,8 @@ async function loadPeek(task, file) {
   const r = await fetch(CFG.server + '/api/diff', { method: 'POST', headers: { 'content-type': 'application/json', 'x-fleet-token': CFG.token }, body: JSON.stringify({ ticket: task, file }) });
   peeks[task + '|' + file] = r.ok ? (await r.json()).diff : '';
 }
-// The change graph's preview opens where it was asked for: in the popover, on the node.
-async function cgPeek(task, file, line, anchor) {
+// A diagram box's preview opens where it was asked for: in the popover, on the box.
+async function popPeek(task, file, line, anchor) {
   const draw = () => {
     popover(anchor, diffView(task, file, +line || 0));
     const box = pop().querySelector('.dt-wrap'), row = box?.querySelector('tr.focus');
@@ -856,8 +859,7 @@ function graphSection(r) {
       ${g.truncated ? `<div class="callout">${ic('info')}<div>Showing files: more than 60 changed symbols</div></div>` : ''}
       <div class="legend">${['added', 'modified', 'deleted'].map(s => `<span><i class="sw" style="--c:${cgStatusColor(s)}"></i>${s}</span>`).join('')}
         ${turns.length ? `<span>border:</span>${turns.slice(-8).map(t => `<span><i class="sw" style="--c:${cgTurnColor(t.n)}"></i>Turn ${+t.n}</span>`).join('')}` : ''}<span>dashed: not from a recorded turn</span><span>rounded: unchanged, links two changes</span>
-        <span class="aside" title="Drag or scroll to move. Pinch or ⌘/Ctrl + scroll to zoom at the pointer.">
-          <button class="btn" data-act="cg-zoom" data-t="${task}" data-k="0.8" aria-label="Zoom in">${ic('zoom-in')}</button><button class="btn" data-act="cg-zoom" data-t="${task}" data-k="1.25" aria-label="Zoom out">${ic('zoom-out')}</button><button class="btn" data-act="cg-fit" data-t="${task}">${ic('screen-normal')} Fit</button></span></div>
+        <span class="aside">drag to move · pinch or ⌘/Ctrl + scroll to zoom · double-click to open</span></div>
       ${mmd(cgMermaid(r, g))}</div>
     ${turns.length ? `<div class="scrub" style="border-top:1px solid var(--border)"><input type="range" min="0" max="${turns.length - 1}" value="${ti}" data-cg-turn="${task}" aria-label="Show the changes up to this turn"><span class="small cg-turn">${cgTurnText(turns, ti)}</span></div>` : ''}
     <div class="files" style="border-top:1px solid var(--border)">
@@ -884,7 +886,7 @@ function wireGraph(root) {
     }
     const f = cgView[task]?.focus;
     if (f != null && (!document.activeElement || document.activeElement === document.body)) sec.querySelector(`g.node[data-cg="${g.nodes.findIndex(n => n.id === f)}"]`)?.focus({ preventScroll: true });
-    cgPanZoom(sec, task);
+    panZoom(sec.querySelector('.mmd svg'), 'cg:' + task, 260);
     cgApply(task);
   }
 }
@@ -904,35 +906,39 @@ function cgCursor({ task, file, line }) {
   if (!n || v.sel === n.id) return;
   v.sel = n.id; cgApply(task);
   const el = sec.querySelector(`g.node[data-cg="${g.nodes.indexOf(n)}"]`), svg = sec.querySelector('.mmd svg');
-  if (el && svg?.cgShow) svg.cgShow(el);
+  if (el && svg?.pz) svg.pz.show(el);
 }
-// Pan and zoom by moving the SVG's viewBox. Drag or scroll moves; pinch or ⌘/Ctrl + scroll zooms at
-// the pointer. The view is kept per task (until the layout changes), so a live repaint keeps it.
-const cgVB = {};
-function cgPanZoom(sec, task) {
-  const svg = sec.querySelector('.mmd svg'), vb = svg?.getAttribute('viewBox');
-  if (!vb || svg.cgZoom) return;
-  const home = vb.split(/[\s,]+/).map(Number);
-  if (cgVB[task]?.home !== vb) cgVB[task] = { home: vb, v: home.slice() };
-  const v = cgVB[task].v, show = () => svg.setAttribute('viewBox', v.join(' '));
-  svg.style.maxWidth = 'none'; svg.style.width = '100%'; svg.style.height = `${Math.round(Math.min(innerHeight * 0.7, Math.max(260, home[3])))}px`;
+// Pan and zoom any diagram by moving its SVG's viewBox. Drag moves; pinch or ⌘/Ctrl + scroll zooms at the
+// pointer; once zoomed in, scroll moves too (at the fitted size it scrolls the page, so a page of diagrams
+// still scrolls). The view is kept per key until the layout changes, so a live repaint keeps it.
+const pzView = {};
+function panZoom(svg, key, minH = 0) {
+  const vb = svg?.getAttribute('viewBox');
+  if (!vb || svg.pz) return svg?.pz;
+  const home = vb.split(/[\s,]+/).map(Number), fitted = svg.getBoundingClientRect().height;
+  if (pzView[key]?.home !== vb) pzView[key] = { home: vb, v: home.slice() };
+  const v = pzView[key].v, show = () => svg.setAttribute('viewBox', v.join(' '));
+  svg.style.maxWidth = 'none'; svg.style.width = '100%'; svg.style.height = `${Math.round(Math.min(innerHeight * 0.7, Math.max(minH, fitted || home[3])))}px`;
   show();
   const unit = () => 1 / svg.getScreenCTM().a; // SVG units per screen pixel
-  svg.cgZoom = (k, x, y) => { // k < 1 zooms in, around the screen point x, y
-    k = Math.min(Math.max(k, home[2] / 20 / v[2]), home[2] * 4 / v[2]);
-    const p = new DOMPoint(x, y).matrixTransform(svg.getScreenCTM().inverse());
-    v[0] = p.x - (p.x - v[0]) * k; v[1] = p.y - (p.y - v[1]) * k; v[2] *= k; v[3] *= k; show();
-  };
-  svg.cgFit = () => { v.splice(0, 4, ...home); show(); };
-  svg.cgShow = el => { // pan (same zoom) until the node is in view, and scroll the page to the graph if it is off screen
-    const s = svg.getBoundingClientRect(), b = el.getBoundingClientRect();
-    if (s.bottom < 0 || s.top > innerHeight) svg.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-    if (b.left >= s.left && b.right <= s.right && b.top >= s.top && b.bottom <= s.bottom) return;
-    const u = unit(); v[0] += (b.left + b.width / 2 - s.left - s.width / 2) * u; v[1] += (b.top + b.height / 2 - s.top - s.height / 2) * u; show();
+  const pz = svg.pz = {
+    zoom(k, x, y) { // k < 1 zooms in, around the screen point x, y
+      k = Math.min(Math.max(k, home[2] / 20 / v[2]), home[2] * 4 / v[2]);
+      const p = new DOMPoint(x, y).matrixTransform(svg.getScreenCTM().inverse());
+      v[0] = p.x - (p.x - v[0]) * k; v[1] = p.y - (p.y - v[1]) * k; v[2] *= k; v[3] *= k; show();
+    },
+    fit() { v.splice(0, 4, ...home); show(); },
+    show(el) { // pan (same zoom) until el is in view, and scroll the page to the diagram if it is off screen
+      const s = svg.getBoundingClientRect(), b = el.getBoundingClientRect();
+      if (s.bottom < 0 || s.top > innerHeight) svg.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      if (b.left >= s.left && b.right <= s.right && b.top >= s.top && b.bottom <= s.bottom) return;
+      const u = unit(); v[0] += (b.left + b.width / 2 - s.left - s.width / 2) * u; v[1] += (b.top + b.height / 2 - s.top - s.height / 2) * u; show();
+    },
   };
   svg.addEventListener('wheel', e => {
+    if (e.ctrlKey || e.metaKey) { e.preventDefault(); return pz.zoom(Math.exp(e.deltaY * 0.01), e.clientX, e.clientY); } // a trackpad pinch arrives as ctrl + wheel
+    if (v[2] >= home[2] * 0.999) return; // fitted or smaller: the page scrolls
     e.preventDefault();
-    if (e.ctrlKey || e.metaKey) return svg.cgZoom(Math.exp(e.deltaY * 0.01), e.clientX, e.clientY); // a trackpad pinch arrives as ctrl + wheel
     const u = unit(); v[0] += e.deltaX * u; v[1] += e.deltaY * u; show();
   }, { passive: false });
   let drag = null;
@@ -947,6 +953,21 @@ function cgPanZoom(sec, task) {
   const end = () => { svg.classList.remove('panning'); setTimeout(() => (drag = null)); };
   svg.addEventListener('pointerup', end); svg.addEventListener('pointercancel', end);
   svg.addEventListener('click', e => { if (drag?.moved) { e.stopPropagation(); e.preventDefault(); } }, true); // the end of a drag is not a click
+  return pz;
+}
+// Every diagram on the page: pan and zoom, with + − Fit on hover. The change graph's keeps its own key (wireGraph).
+function wirePanZoom(root) {
+  root.querySelectorAll('.mmd').forEach((m, i) => {
+    if (!panZoom(m.querySelector('svg'), `${sel}|${i}`) || m.querySelector('.pz')) return;
+    m.insertAdjacentHTML('beforeend', `<div class="pz" role="toolbar" aria-label="Diagram view"><button class="btn" data-act="pz" data-k="0.8" aria-label="Zoom in" title="Zoom in (or pinch, ⌘/Ctrl + scroll)">${ic('zoom-in')}</button>`
+      + `<button class="btn" data-act="pz" data-k="1.25" aria-label="Zoom out" title="Zoom out">${ic('zoom-out')}</button><button class="btn" data-act="pz-fit" aria-label="Fit" title="Fit the whole diagram">${ic('screen-normal')}</button></div>`);
+  });
+}
+// A diagram box that does something when clicked or on Enter.
+function hotNode(el, label, open) {
+  el.dataset.hot = 1; el.classList.add('hot'); el.setAttribute('tabindex', '0'); el.setAttribute('role', 'button'); el.setAttribute('aria-label', label);
+  el.addEventListener('click', open);
+  el.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
 }
 function cgApply(task) {
   const sec = cgSec(task), g = cgOf(task), v = cgView[task] || {};
@@ -983,7 +1004,7 @@ function cgSelect(task, id, anchor) {
     <div class="pop-foot">${VS && r?.codeDir && n.status !== 'deleted' ? `<button class="btn" data-pop="open" title="Open it in the editor (or double-click the node)">${ic('go-to-file')} Open</button>` : ''}${r?.mergeBase ? `<button class="btn" data-pop="diff">${ic('diff')} Diff</button><button class="btn" data-pop="peek">${ic('eye')} Preview</button>` : ''}<button class="btn primary" data-pop="annotate">${ic('comment')} Annotate</button></div>`,
     { open: () => { closePop(); cgOpenNode(task, n); },
       diff: () => act('diff', { dir: r.codeDir || ST.snap.repoDir, file: n.file, rev: r.mergeBase, right: r.codeDir ? undefined : r.branch, line: line || '' }),
-      peek: () => cgPeek(task, n.file, line || '', el),
+      peek: () => popPeek(task, n.file, line || '', el),
       annotate: () => annotate(task, el, cgName(n), { file: n.file, line }) });
   el.focus?.({ preventScroll: true }); // keeps j / k in the graph
 }
@@ -1122,9 +1143,6 @@ function annotationTarget(el) {
 // Diagrams: hover lights a box, clicking one shows its files and lets you annotate it; changed boxes are tinted.
 function wireDiagrams(root) {
   for (const md of root.querySelectorAll('.md.guide')) {
-    // Wide diagrams shrink to fit; Zoom shows them at actual size with a scrollbar.
-    for (const m of md.querySelectorAll('.mmd')) if (!m.previousElementSibling?.classList.contains('zoom-b'))
-      m.insertAdjacentHTML('beforebegin', `<button class="chip zoom-b" data-zoom aria-pressed="false">${ic('zoom-in')} Zoom</button>`);
     const heads = [...md.querySelectorAll('.gs-reading-order h3')];
     for (const el of md.querySelectorAll('.mmd svg :is(g.node, text.messageText, text.actor, g.actor)')) {
       const label = el.textContent.trim();
@@ -1142,6 +1160,24 @@ function wireDiagrams(root) {
       el.addEventListener('click', open);
       el.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
     }
+  }
+  // Change map: a file box opens the file, its diff, or a preview in place; double-click opens the file.
+  for (const m of root.querySelectorAll('[data-cm]')) {
+    const w = ST.snap.workers.find(x => x.name === m.dataset.cm), boxes = cmFiles[m.dataset.cm] || {};
+    for (const el of m.querySelectorAll('svg g.node')) {
+      const file = boxes[(el.id || '').match(/flowchart-(F\d+_\d+)-\d+$/)?.[1]];
+      if (!w || !file || el.dataset.hot) continue;
+      const open = () => act('open', { dir: w.dir, file, beside: true });
+      hotNode(el, file, () => popover(el, `<div class="pop-h"><b>${esc(file.split('/').pop())}</b></div><div class="mono small">${esc(file)}</div>
+        <div class="pop-foot">${VS ? `<button class="btn" data-pop="open">${ic('go-to-file')} Open</button>` : ''}${w.mergeBase ? `<button class="btn" data-pop="diff">${ic('diff')} Diff</button>` : ''}${w.ticket ? `<button class="btn" data-pop="peek">${ic('eye')} Preview</button>` : ''}</div>`,
+        { open: () => { closePop(); open(); }, diff: () => act('diff', { dir: w.dir, file, rev: w.mergeBase }), peek: () => popPeek(w.ticket, file, '', el) }));
+      if (VS) el.addEventListener('dblclick', () => { closePop(); open(); });
+    }
+  }
+  // Fleet map: a worker box goes to that worker's page.
+  for (const m of root.querySelectorAll('[data-fm]')) for (const el of m.querySelectorAll('svg g.node')) {
+    const w = ST.snap.workers[(el.id || '').match(/flowchart-w(\d+)W-\d+$/)?.[1]];
+    if (w && !el.dataset.hot) hotNode(el, `${w.name}${w.ticket ? ' · ' + w.ticket : ''}`, () => select(w.name));
   }
 }
 
@@ -1279,7 +1315,7 @@ function overviewPage() {
   return `<div class="head"><div class="grow"><h1>${ic('bell')} Needs you</h1><p class="lede">${esc(s.name)} fleet · ${esc(fleetSummary())}</p></div></div>
     <section><div class="inbox">${cards.join('') || `<div class="card calm">${ic('pass-filled')}<span>Nothing needs you right now.${count('working') ? ` ${plural(count('working'), 'agent')} working.` : ''}</span></div>`}</div></section>
     <section><h2>Working</h2><div class="card list">${running.map(activityItem).join('') || '<div class="empty">No agent is working right now.</div>'}</div></section>
-    <section><h2>Fleet map <span class="aside muted">who holds each worker · running agents · messages · files two workers share</span></h2><div class="card"><div class="card-b">${mmd(fleetGraph())}</div></div></section>
+    <section><h2>Fleet map <span class="aside muted">who holds each worker · running agents · messages · files two workers share</span></h2><div class="card"><div class="card-b" data-fm>${mmd(fleetGraph())}</div></div></section>
     <section><h2>Fleet over time <span class="aside muted">${ST.changedAt ? 'last change ' + esc(ago(ST.changedAt)) : ''}</span></h2><div class="card">${scrubView()}</div></section>
     <section><div class="card"><details class="fold" data-k="areas"><summary>${ic('chevron-right')} Changes by area · ${plural(ST.agg.areas.length, 'area')} across all workers</summary><div class="card-b">${areaChart()}</div></details></div></section>
     <section><h2>Tickets</h2><div class="card"><table><tr><th>Ticket</th><th>State</th><th>Harness</th><th>Updated</th><th></th><th></th></tr>
@@ -1396,7 +1432,7 @@ function workerPage(w) {
       <div class="grid2">
         <div class="card"><div class="card-h">Branch<span class="aside">${esc(w.base)} → ${esc(w.branch)}</span></div><div class="card-b">${mmd(branchGraph(w))}
           <div style="margin-top:8px">${(w.commits || []).slice(0, 8).map(c => `<div class="hbar" style="grid-template-columns:64px 1fr auto" data-tip="${esc(c.subject)}"><span class="mono muted">${esc(c.sha.slice(0, 7))}</span><span class="lbl">${esc(c.subject)}</span><span class="muted num">${esc(c.when)}</span></div>`).join('')}</div></div></div>
-        <div class="card"><div class="card-h">Change map<span class="aside">by area · dashed = uncommitted</span></div><div class="card-b">${changeMap(w) ? mmd(changeMap(w)) : '<div class="empty">No changes.</div>'}</div></div>
+        <div class="card"><div class="card-h">Change map<span class="aside">by area · dashed = uncommitted</span></div><div class="card-b">${changeMap(w) ? `<div data-cm="${esc(w.name)}">${mmd(changeMap(w))}</div>` : '<div class="empty">No changes.</div>'}</div></div>
         <div class="card"><div class="card-h">Churn by file<span class="aside">top 10</span></div><div class="card-b">${churnChart(w)}</div></div></div></div></details></div></section>`;
 }
 
@@ -1439,7 +1475,7 @@ function render() {
   for (const md of content.querySelectorAll('.md.guide')) { wireGuide(md); decorateGuide(md); markAnnotations(md); }
   applyPeeks(content);
   main.scrollTop = top;
-  drawMermaid(content).then(() => { wireDiagrams(content); wireGraph(content); });
+  drawMermaid(content).then(() => { wireDiagrams(content); wireGraph(content); wirePanZoom(content); });
 }
 // Screen readers hear the moments that matter, not every repaint.
 function announce(prev, next) {
@@ -1503,8 +1539,6 @@ document.addEventListener('change', e => { if (e.target.matches('[data-switch]')
 document.addEventListener('selectionchange', () => { if (!getSelection().toString().trim()) document.getElementById('selbtn').hidden = true; });
 
 document.addEventListener('click', async e => {
-  const z = e.target.closest('[data-zoom]');
-  if (z) { const on = z.nextElementSibling.classList.toggle('zoom'); z.setAttribute('aria-pressed', on); z.innerHTML = `${ic(on ? 'zoom-out' : 'zoom-in')} ${on ? 'Fit' : 'Zoom'}`; return; }
   const j = e.target.closest('[data-jump]');
   if (j) return document.getElementById(j.dataset.jump)?.scrollIntoView({ block: 'start' });
   const x = e.target.closest('.tl-text');
@@ -1538,8 +1572,8 @@ document.addEventListener('click', async e => {
     case 'cg-build': return act('graph', { task: d.t, force: true });
     case 'cg-chain': { const v = (cgView[d.t] ||= {}); v.chain = v.chain === +d.i ? null : +d.i; return cgApply(d.t); }
     case 'cg-node': return cgSelect(d.t, d.id, t);
-    case 'cg-zoom': { const s = cgSec(d.t)?.querySelector('.mmd svg'), b = s?.getBoundingClientRect(); return b && s.cgZoom?.(+d.k, b.left + b.width / 2, b.top + b.height / 2); }
-    case 'cg-fit': return cgSec(d.t)?.querySelector('.mmd svg')?.cgFit?.();
+    case 'pz': { const s = t.closest('.mmd')?.querySelector('svg'), b = s?.getBoundingClientRect(); return b && s.pz?.zoom(+d.k, b.left + b.width / 2, b.top + b.height / 2); }
+    case 'pz-fit': return t.closest('.mmd')?.querySelector('svg')?.pz?.fit();
   }
 });
 document.addEventListener('keydown', e => {
