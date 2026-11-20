@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const { execFile, spawn } = require('child_process');
 const { findFleetDir } = require('./gather');
 const review = require('./review');
+const graph = require('./graph');
 
 const LABEL = { working: 'Working', needs: 'Needs you', review: 'Ready for review', stuck: 'Stuck', idle: 'Idle' };
 const title = w => w.record?.title || w.ticket || w.name;
@@ -255,6 +256,11 @@ function activate(ctx) {
         await vscode.commands.executeCommand('vscode.diff', at(m.rev), right, `${path.basename(m.file)} (${m.rev.slice(0, 7)} ↔ ${m.right || path.basename(m.dir)})`,
           { selection: new vscode.Range(line, 0, line, 0) });
       }
+      if (m.type === 'graph') {
+        // The page shows a spinner from the click until the graph is on the server.
+        webview.postMessage({ type: 'cg-busy', task: m.task, on: true });
+        try { await buildGraph(F, m.task, m.force); } finally { webview.postMessage({ type: 'cg-busy', task: m.task, on: false }); }
+      }
     }
     return () => sub.dispose();
   }
@@ -336,11 +342,55 @@ function activate(ctx) {
     })),
   );
   // Through the server, so every view updates at once; straight to the file when it is down.
+  // Resolves when the server has answered (or the fallback ran).
   function send(F, api, body, fallback) {
     F.sig = ''; // the server's next push re-syncs the threads (in place, so other half-typed replies survive)
-    const req = http.request(`${F.base()}/api/${api}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-fleet-token': F.token() } });
-    req.on('error', fallback);
-    req.end(JSON.stringify(body));
+    return new Promise(res => {
+      const req = http.request(`${F.base()}/api/${api}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-fleet-token': F.token() } },
+        r => { r.resume(); r.on('end', res); });
+      req.on('error', e => { fallback(e); res(); });
+      req.end(JSON.stringify(body));
+    });
+  }
+  // --- change graph: symbols and calls come from this window's language servers, which only the
+  // extension host can ask. graph.js does the rest; the server stores the result for every view.
+  const at = r => ({ line: r.start.line + 1, endLine: r.end.line + 1 });
+  const lsp = {
+    async symbols(abs) {
+      const uri = vscode.Uri.file(abs), ask = () => vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', uri);
+      let r = await ask();
+      // A language server that has just started answers empty: one retry, then the file stays a file node.
+      if (!r?.length && fs.statSync(abs).size) { await sleep(3000); r = await ask(); }
+      const out = [];
+      const walk = (s, depth) => {
+        const range = s.range || s.location.range, sel = s.selectionRange || range;
+        out.push({ name: s.name, kind: vscode.SymbolKind[s.kind], ...at(range), selLine: sel.start.line + 1, selChar: sel.start.character, depth });
+        for (const c of s.children || []) walk(c, depth + 1);
+      };
+      for (const s of r || []) walk(s, s.children ? 0 : s.containerName ? 1 : 0); // DocumentSymbol[] or SymbolInformation[]
+      return out;
+    },
+    async outgoing(abs, s) {
+      const items = await vscode.commands.executeCommand('vscode.prepareCallHierarchy', vscode.Uri.file(abs), new vscode.Position(s.selLine - 1, s.selChar)) || [];
+      const calls = (await Promise.all(items.map(i => vscode.commands.executeCommand('vscode.provideOutgoingCalls', i)))).flat().filter(Boolean);
+      return calls.map(({ to }) => ({ file: to.uri.fsPath, name: to.name, kind: vscode.SymbolKind[to.kind], ...at(to.range),
+        selLine: to.selectionRange.start.line + 1, selChar: to.selectionRange.start.character }));
+    },
+  };
+  const building = new Map(); // task → the build in flight; a second click waits on the same one
+  function buildGraph(F, task, force) {
+    const r = F.state?.snap.records.find(x => x.task === task), tree = r?.harness?.tree;
+    if (!r?.codeDir || !r.mergeBase || !tree) return;
+    if (building.has(task)) return building.get(task);
+    if (!force && F.state.graphs?.[task]?.tree === tree) return;
+    const t0 = Date.now();
+    const job = vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: `Change graph: ${task}` }, async () => {
+      const g = await graph.build({ fleet: F.dir, task, dir: r.codeDir, base: r.mergeBase, tree, lsp });
+      log.info(`graph ${task}: ${g.nodes.filter(n => n.status !== 'context').length} symbols, ${g.chains.length} chains, ${Date.now() - t0} ms`);
+      await send(F, 'graph', { ticket: task, graph: g }, e => log.error(`graph ${task}: could not reach the server: ${e.message}`));
+    }).finally(() => building.delete(task));
+    building.set(task, job);
+    return job;
   }
   function addComment(reply, intent) {
     const { F, w } = workerOf(reply.thread.uri.fsPath);
